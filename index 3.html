@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="ConvoIntel">
+  <meta name="theme-color" content="#0a0a0f">
+  <title>Conversation Intelligence</title>
+  
+  <link rel="manifest" href="manifest.json">
+  
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { height: 100%; width: 100%; overflow: hidden; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background-color: #0a0a0f;
+      color: #e2e8f0;
+      -webkit-font-smoothing: antialiased;
+    }
+    #root { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    @supports (padding: max(0px)) {
+      #root {
+        padding-left: max(0px, env(safe-area-inset-left));
+        padding-right: max(0px, env(safe-area-inset-right));
+        padding-bottom: max(0px, env(safe-area-inset-bottom));
+      }
+    }
+    
+    /* Pulsing animation for mic button */
+    @keyframes mic-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7); }
+      50% { box-shadow: 0 0 0 20px rgba(99, 102, 241, 0); }
+    }
+    .mic-pulse { animation: mic-pulse 2s infinite; }
+  </style>
+  
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  
+  <script type="text/babel" data-type="module">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ============================================================================
+// HTTPS / SECURE CONTEXT CHECK
+// ============================================================================
+const isSecureContext = () => {
+  return window.isSecureContext || 
+         location.protocol === 'https:' || 
+         location.hostname === 'localhost' || 
+         location.hostname === '127.0.0.1';
+};
+
+const hasGetUserMedia = () => {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+};
+
+const generateId = () => crypto.randomUUID?.() || Math.random().toString(36).substr(2, 9);
+const formatTime = (ms) => {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`;
+};
+const formatDate = (d) => new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+// NLP Engine
+const NLP = {
+  sentiment: (text) => {
+    const pos = ['great','good','excellent','amazing','wonderful','fantastic','love','happy','agree','yes','perfect','brilliant','awesome','pleased','excited','opportunity','success','win','benefit','definitely','absolutely'];
+    const neg = ['bad','terrible','awful','hate','disagree','no','wrong','problem','issue','concern','worried','frustrated','disappointed','unfortunately','difficult','impossible','fail','risk','threat','never'];
+    const words = text.toLowerCase().split(/\W+/);
+    let score = 0;
+    words.forEach(w => { if (pos.includes(w)) score += 1; if (neg.includes(w)) score -= 1; });
+    const norm = Math.max(-1, Math.min(1, score / Math.max(words.length * 0.1, 1)));
+    return { score: norm, label: norm > 0.2 ? 'positive' : norm < -0.2 ? 'negative' : 'neutral' };
+  },
+  topics: (text) => {
+    const stop = new Set(['the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be','been','have','has','had','do','does','did','will','would','could','should','that','this','these','those','i','you','he','she','it','we','they','what','which','who','when','where','why','how','all','each','every','both','few','more','most','other','some','no','not','only','so','than','too','very','just','can','my','your','our','their','its','about','into','through','during','before','after','again','then','here','there','any','also','well','now','get','got','like','know','think','want','need','going','thing','things','yeah','okay','right','sure','mean','really','actually','basically','something']);
+    const words = text.toLowerCase().split(/\W+/).filter(w => w.length > 3 && !stop.has(w));
+    const freq = {};
+    words.forEach(w => freq[w] = (freq[w] || 0) + 1);
+    return Object.entries(freq).filter(([_,c]) => c >= 2).sort((a,b) => b[1] - a[1]).slice(0, 8).map(([word, count]) => ({ word, count }));
+  },
+  questions: (text) => {
+    return text.split(/[.!?]+/).filter(s => /^(what|who|where|when|why|how|is|are|was|were|do|does|did|can|could|would|should|will|have|has)\b/i.test(s.trim()) || s.includes('?')).map(s => ({ text: s.trim() + (s.includes('?') ? '' : '?') }));
+  },
+  actions: (text, speaker) => {
+    const patterns = [/(?:i will|i'll|we will|we'll|going to)\s+(.+?)(?:\.|$)/gi, /(?:need to|have to|should)\s+(.+?)(?:\.|$)/gi, /(?:let me|let's)\s+(.+?)(?:\.|$)/gi];
+    const items = [];
+    patterns.forEach(p => { let m; while ((m = p.exec(text)) !== null) { if (m[1].length > 10 && m[1].length < 200) items.push({ id: generateId(), action: m[1].trim(), owner: speaker || 'Unassigned' }); }});
+    return items;
+  },
+  decisions: (text) => {
+    const patterns = [/(?:we decided|agreed to|decision is)\s+(.+?)(?:\.|$)/gi, /(?:let's go with|going with)\s+(.+?)(?:\.|$)/gi];
+    const items = [];
+    patterns.forEach(p => { let m; while ((m = p.exec(text)) !== null) items.push(m[1].trim()); });
+    return items;
+  },
+  style: (segs) => {
+    const text = segs.map(s => s.text).join(' ');
+    const words = text.split(/\s+/);
+    const sentences = text.split(/[.!?]+/).filter(Boolean);
+    const avg = words.length / Math.max(sentences.length, 1);
+    const iCount = (text.match(/\bi\b/gi) || []).length;
+    const weCount = (text.match(/\bwe\b/gi) || []).length;
+    return {
+      assertiveness: Math.min(100, Math.round((text.match(/!/g) || []).length * 10 + (iCount / words.length * 500))),
+      directnessLevel: Math.min(100, Math.round(100 - avg * 3)),
+      collaborativeIndex: Math.round(weCount / Math.max(iCount + weCount, 1) * 100),
+      preferredPace: avg < 10 ? 'fast' : avg > 20 ? 'slow' : 'moderate'
+    };
+  },
+  summary: (segs, topics, decisions, actions) => {
+    const dur = segs.length > 0 ? Math.round((segs[segs.length - 1].timestamp) / 60000) : 0;
+    const speakers = [...new Set(segs.map(s => s.speaker))];
+    let sum = `This ${dur} minute conversation involved ${speakers.length} participant${speakers.length !== 1 ? 's' : ''}`;
+    if (topics.length) sum += ` and covered ${topics.slice(0, 3).map(t => t.word).join(', ')}`;
+    sum += '.';
+    if (decisions.length) sum += ` ${decisions.length} decision${decisions.length !== 1 ? 's were' : ' was'} made.`;
+    if (actions.length) sum += ` ${actions.length} action item${actions.length !== 1 ? 's' : ''} identified.`;
+    return sum;
+  },
+  insights: (seg, profiles) => {
+    const insights = [];
+    if (!seg) return insights;
+    const sent = NLP.sentiment(seg.text);
+    if (sent.label === 'negative') insights.push({ type: 'warning', priority: 'high', message: 'Negative sentiment detected', action: 'Acknowledge their concerns first' });
+    if (NLP.questions(seg.text).length > 0) insights.push({ type: 'opportunity', priority: 'high', message: 'Question detected', action: 'Provide a clear response' });
+    if (['agree', 'yes', 'exactly', 'right'].some(w => seg.text.toLowerCase().includes(w))) insights.push({ type: 'opportunity', priority: 'medium', message: 'Agreement signal', action: 'Good moment for next steps' });
+    const profile = profiles[seg.speaker];
+    if (profile?.communicationStyle?.assertiveness > 60) insights.push({ type: 'strategy', priority: 'medium', message: `${seg.speaker} is assertive`, action: 'Be direct and confident' });
+    return insights;
+  }
+};
+
+// Storage
+const Storage = {
+  get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; }},
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  sessions: () => Storage.get('ci_sessions') || [],
+  saveSessions: (s) => Storage.set('ci_sessions', s),
+  profiles: () => Storage.get('ci_profiles') || {},
+  saveProfiles: (p) => Storage.set('ci_profiles', p),
+  micGranted: () => Storage.get('ci_mic_granted') || false,
+  setMicGranted: (v) => Storage.set('ci_mic_granted', v)
+};
+
+// ============================================================================
+// IMPROVED MICROPHONE HOOK - iOS COMPATIBLE
+// ============================================================================
+const useMicrophone = () => {
+  const [permission, setPermission] = useState('unknown'); // 'unknown', 'prompt', 'granted', 'denied', 'unavailable'
+  const [listening, setListening] = useState(false);
+  const [level, setLevel] = useState(0);
+  const [interim, setInterim] = useState('');
+  const [error, setError] = useState(null);
+  const [micTestPassed, setMicTestPassed] = useState(false);
+  
+  const streamRef = useRef(null);
+  const ctxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const recRef = useRef(null);
+  const activeRef = useRef(false);
+  const frameRef = useRef(null);
+
+  // Check environment on mount
+  useEffect(() => {
+    // Check if we have the APIs we need
+    if (!hasGetUserMedia()) {
+      setPermission('unavailable');
+      setError('Microphone API not available on this device/browser');
+      return;
+    }
+    
+    if (!isSecureContext()) {
+      setPermission('unavailable');
+      setError('Microphone requires HTTPS. Please access via https:// or localhost');
+      return;
+    }
+    
+    // Check stored permission (but don't trust it completely on iOS)
+    if (Storage.micGranted()) {
+      setPermission('granted');
+    } else {
+      setPermission('prompt');
+    }
+    
+    return () => stopMic();
+  }, []);
+
+  // Request microphone permission - MUST be called from user gesture (tap/click)
+  const requestPermission = async () => {
+    console.log('[Mic] Requesting permission...');
+    setError(null);
+    
+    if (!hasGetUserMedia()) {
+      setError('Microphone not supported on this browser');
+      setPermission('unavailable');
+      return false;
+    }
+    
+    if (!isSecureContext()) {
+      setError('Microphone requires HTTPS connection');
+      setPermission('unavailable');
+      return false;
+    }
+    
+    try {
+      // Request microphone with simple constraints first (iOS is picky)
+      console.log('[Mic] Calling getUserMedia...');
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: true  // Simple constraint works better on iOS
+      });
+      
+      console.log('[Mic] Got stream:', stream);
+      console.log('[Mic] Audio tracks:', stream.getAudioTracks());
+      
+      // Test that we actually have audio
+      const tracks = stream.getAudioTracks();
+      if (tracks.length === 0) {
+        throw new Error('No audio tracks received');
+      }
+      
+      // Create audio context to verify audio is flowing
+      const testCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const testAnalyser = testCtx.createAnalyser();
+      testAnalyser.fftSize = 256;
+      const testSource = testCtx.createMediaStreamSource(stream);
+      testSource.connect(testAnalyser);
+      
+      // Check for audio data
+      const testData = new Uint8Array(testAnalyser.frequencyBinCount);
+      testAnalyser.getByteFrequencyData(testData);
+      
+      console.log('[Mic] Test audio data sample:', testData.slice(0, 10));
+      
+      // Clean up test
+      testCtx.close();
+      stream.getTracks().forEach(t => t.stop());
+      
+      // Success!
+      setPermission('granted');
+      setMicTestPassed(true);
+      Storage.setMicGranted(true);
+      console.log('[Mic] Permission granted successfully');
+      return true;
+      
+    } catch (e) {
+      console.error('[Mic] Permission error:', e);
+      console.error('[Mic] Error name:', e.name);
+      console.error('[Mic] Error message:', e.message);
+      
+      let errorMessage = 'Microphone access failed';
+      
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+        errorMessage = 'Microphone permission denied. Please allow access in your browser/device settings.';
+        setPermission('denied');
+      } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
+        errorMessage = 'No microphone found on this device';
+        setPermission('unavailable');
+      } else if (e.name === 'NotReadableError' || e.name === 'TrackStartError') {
+        errorMessage = 'Microphone is in use by another app';
+        setPermission('prompt');
+      } else if (e.name === 'OverconstrainedError') {
+        errorMessage = 'Microphone constraints not satisfiable';
+        setPermission('prompt');
+      } else if (e.name === 'SecurityError') {
+        errorMessage = 'Microphone blocked by security policy. Ensure you are using HTTPS.';
+        setPermission('unavailable');
+      } else {
+        errorMessage = `Microphone error: ${e.message || e.name || 'Unknown error'}`;
+        setPermission('prompt');
+      }
+      
+      setError(errorMessage);
+      Storage.setMicGranted(false);
+      return false;
+    }
+  };
+
+  // Start listening with microphone
+  const startMic = async (onTranscript) => {
+    console.log('[Mic] Starting microphone...');
+    setError(null);
+    
+    try {
+      // Get fresh stream
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      
+      console.log('[Mic] Stream obtained for recording');
+      
+      // Setup audio context for level meter
+      ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      
+      // iOS Safari requires resume after user gesture
+      if (ctxRef.current.state === 'suspended') {
+        await ctxRef.current.resume();
+      }
+      
+      analyserRef.current = ctxRef.current.createAnalyser();
+      analyserRef.current.fftSize = 256;
+      analyserRef.current.smoothingTimeConstant = 0.8;
+      
+      const source = ctxRef.current.createMediaStreamSource(stream);
+      source.connect(analyserRef.current);
+      
+      activeRef.current = true;
+      setListening(true);
+      setPermission('granted');
+      Storage.setMicGranted(true);
+      
+      // Audio level monitoring
+      const updateLevel = () => {
+        if (!activeRef.current || !analyserRef.current) return;
+        
+        const data = new Uint8Array(analyserRef.current.frequencyBinCount);
+        analyserRef.current.getByteFrequencyData(data);
+        const avg = data.reduce((a, b) => a + b, 0) / data.length;
+        setLevel(Math.min(100, avg * 2));
+        
+        frameRef.current = requestAnimationFrame(updateLevel);
+      };
+      updateLevel();
+      
+      // Setup speech recognition (if available)
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SR) {
+        console.log('[Mic] Setting up speech recognition');
+        const rec = new SR();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = 'en-US';
+        rec.maxAlternatives = 1;
+        
+        rec.onstart = () => {
+          console.log('[Mic] Speech recognition started');
+        };
+        
+        rec.onresult = (e) => {
+          let final = '', inter = '';
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const transcript = e.results[i][0].transcript;
+            if (e.results[i].isFinal) {
+              final += transcript;
+            } else {
+              inter += transcript;
+            }
+          }
+          setInterim(final || inter);
+          if (final && onTranscript) {
+            console.log('[Mic] Final transcript:', final);
+            onTranscript(final);
+          }
+        };
+        
+        rec.onerror = (e) => {
+          console.error('[Mic] Speech recognition error:', e.error);
+          if (e.error === 'not-allowed') {
+            setError('Speech recognition not allowed');
+          } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+            console.log('[Mic] Non-fatal speech error:', e.error);
+          }
+        };
+        
+        rec.onend = () => {
+          console.log('[Mic] Speech recognition ended, activeRef:', activeRef.current);
+          if (activeRef.current) {
+            try {
+              setTimeout(() => {
+                if (activeRef.current) rec.start();
+              }, 100);
+            } catch (e) {
+              console.log('[Mic] Could not restart recognition:', e);
+            }
+          }
+        };
+        
+        recRef.current = rec;
+        rec.start();
+      } else {
+        console.log('[Mic] Speech recognition not available');
+        setError('Speech recognition not supported - audio recording only');
+      }
+      
+      return true;
+      
+    } catch (e) {
+      console.error('[Mic] Start error:', e);
+      setError(`Failed to start: ${e.message}`);
+      if (e.name === 'NotAllowedError') {
+        setPermission('denied');
+        Storage.setMicGranted(false);
+      }
+      return false;
+    }
+  };
+
+  // Stop microphone
+  const stopMic = () => {
+    console.log('[Mic] Stopping microphone');
+    activeRef.current = false;
+    setListening(false);
+    setLevel(0);
+    setInterim('');
+    
+    if (frameRef.current) {
+      cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+    
+    if (recRef.current) {
+      try { recRef.current.stop(); } catch (e) {}
+      recRef.current = null;
+    }
+    
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => {
+        t.stop();
+        console.log('[Mic] Stopped track:', t.label);
+      });
+      streamRef.current = null;
+    }
+    
+    if (ctxRef.current) {
+      try { ctxRef.current.close(); } catch (e) {}
+      ctxRef.current = null;
+    }
+    
+    analyserRef.current = null;
+  };
+
+  return { 
+    permission, 
+    listening, 
+    level, 
+    interim, 
+    error, 
+    micTestPassed,
+    requestPermission, 
+    startMic, 
+    stopMic 
+  };
+};
+
+// Main App
+function App() {
+  const [tab, setTab] = useState('record');
+  const [recording, setRecording] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [startTime, setStartTime] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [segments, setSegments] = useState([]);
+  const [speaker, setSpeaker] = useState('Speaker 1');
+  const [speakers, setSpeakers] = useState(['Speaker 1', 'Speaker 2']);
+  const [manual, setManual] = useState('');
+  const [mode, setMode] = useState(() => Storage.micGranted() ? 'voice' : 'manual');
+  const [analysis, setAnalysis] = useState({ sentiment: { score: 0, label: 'neutral' }, topics: [], questions: [], actions: [], decisions: [], stats: {} });
+  const [insights, setInsights] = useState([]);
+  const [sessions, setSessions] = useState([]);
+  const [profiles, setProfiles] = useState({});
+  const [selected, setSelected] = useState(null);
+
+  const mic = useMicrophone();
+  const scrollRef = useRef(null);
+  const timerRef = useRef(null);
+
+  useEffect(() => { setSessions(Storage.sessions()); setProfiles(Storage.profiles()); }, []);
+  useEffect(() => { if (mic.permission === 'granted' && mic.micTestPassed) setMode('voice'); }, [mic.permission, mic.micTestPassed]);
+  
+  useEffect(() => {
+    if (recording && !paused) {
+      timerRef.current = setInterval(() => setElapsed(Date.now() - startTime), 1000);
+    } else clearInterval(timerRef.current);
+    return () => clearInterval(timerRef.current);
+  }, [recording, paused, startTime]);
+
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [segments]);
+
+  useEffect(() => {
+    if (segments.length === 0) return;
+    const text = segments.map(s => s.text).join(' ');
+    const last = segments[segments.length - 1];
+    const stats = {};
+    speakers.forEach(sp => {
+      const segs = segments.filter(s => s.speaker === sp);
+      const txt = segs.map(s => s.text).join(' ');
+      stats[sp] = { count: segs.length, words: txt.split(/\s+/).length, sentiment: NLP.sentiment(txt) };
+    });
+    setAnalysis({
+      sentiment: NLP.sentiment(text),
+      topics: NLP.topics(text),
+      questions: NLP.questions(text),
+      actions: segments.flatMap(s => NLP.actions(s.text, s.speaker)),
+      decisions: NLP.decisions(text),
+      stats
+    });
+    setInsights(NLP.insights(last, profiles));
+  }, [segments, speakers, profiles]);
+
+  const addSeg = (text) => {
+    if (!text.trim()) return;
+    setSegments(p => [...p, { id: generateId(), speaker, text: text.trim(), timestamp: Date.now() - startTime, sentiment: NLP.sentiment(text) }]);
+  };
+
+  const startRec = async () => {
+    setRecording(true);
+    setPaused(false);
+    setStartTime(Date.now());
+    setElapsed(0);
+    setSegments([]);
+    setAnalysis({ sentiment: { score: 0, label: 'neutral' }, topics: [], questions: [], actions: [], decisions: [], stats: {} });
+    if (mode === 'voice') {
+      const ok = await mic.startMic(t => { if (t.trim()) addSeg(t.trim()); });
+      if (!ok) setMode('manual');
+    }
+  };
+
+  const stopRec = () => {
+    setRecording(false);
+    setPaused(false);
+    mic.stopMic();
+    if (segments.length > 0) {
+      const sess = {
+        id: generateId(),
+        startTime,
+        endTime: Date.now(),
+        duration: elapsed,
+        segments,
+        analysis: { summary: NLP.summary(segments, analysis.topics, analysis.decisions, analysis.actions), ...analysis },
+        speakers: [...new Set(segments.map(s => s.speaker))]
+      };
+      const updated = [sess, ...sessions];
+      setSessions(updated);
+      Storage.saveSessions(updated);
+      updateProfiles(segments);
+    }
+  };
+
+  const togglePause = async () => {
+    if (paused) {
+      setPaused(false);
+      if (mode === 'voice') await mic.startMic(t => { if (t.trim()) addSeg(t.trim()); });
+    } else {
+      setPaused(true);
+      mic.stopMic();
+    }
+  };
+
+  const updateProfiles = (segs) => {
+    const p = { ...profiles };
+    [...new Set(segs.map(s => s.speaker))].forEach(sp => {
+      const spSegs = segs.filter(s => s.speaker === sp);
+      if (!p[sp]) p[sp] = { id: generateId(), name: sp, sessions: [], communicationStyle: {}, interactionHistory: { topicsDiscussed: {} }, strategicNotes: '' };
+      const style = NLP.style(spSegs);
+      if (!Object.keys(p[sp].communicationStyle).length) p[sp].communicationStyle = style;
+      else Object.keys(style).forEach(k => { if (typeof style[k] === 'number') p[sp].communicationStyle[k] = Math.round((p[sp].communicationStyle[k] + style[k]) / 2); else p[sp].communicationStyle[k] = style[k]; });
+      NLP.topics(spSegs.map(s => s.text).join(' ')).forEach(t => { p[sp].interactionHistory.topicsDiscussed[t.word] = (p[sp].interactionHistory.topicsDiscussed[t.word] || 0) + t.count; });
+      p[sp].strategicNotes = p[sp].communicationStyle.assertiveness > 60 ? `${sp} is assertive. Be direct.` : p[sp].communicationStyle.collaborativeIndex > 50 ? `${sp} is collaborative. Use "we" language.` : `${sp} has balanced style.`;
+      p[sp].sessions.push(Date.now());
+    });
+    setProfiles(p);
+    Storage.saveProfiles(p);
+  };
+
+  const exportMD = (s) => {
+    let md = `# Conversation - ${formatDate(s.startTime)}\n\n**Duration:** ${formatTime(s.duration)}\n**Participants:** ${s.speakers.join(', ')}\n\n## Summary\n${s.analysis.summary}\n\n`;
+    if (s.analysis.topics.length) { md += `## Topics\n`; s.analysis.topics.forEach(t => md += `- ${t.word} (×${t.count})\n`); md += '\n'; }
+    if (s.analysis.actions.length) { md += `## Action Items\n`; s.analysis.actions.forEach(a => md += `- [ ] ${a.action} (${a.owner})\n`); md += '\n'; }
+    md += `## Transcript\n\n`; s.segments.forEach(seg => md += `**${seg.speaker}** [${formatTime(seg.timestamp)}]: ${seg.text}\n\n`);
+    const blob = new Blob([md], { type: 'text/markdown' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `conversation_${Date.now()}.md`; a.click();
+  };
+
+  const color = (sp) => ({ 'Speaker 1': '#6366f1', 'Speaker 2': '#ec4899', 'Speaker 3': '#14b8a6', 'Speaker 4': '#f59e0b', 'Speaker 5': '#8b5cf6' }[sp] || '#6b7280');
+  const emoji = (l) => l === 'positive' ? '😊' : l === 'negative' ? '😟' : '😐';
+  const sentColor = (s) => s > 0.2 ? '#10b981' : s < -0.2 ? '#ef4444' : '#f59e0b';
+
+  return (
+    <div style={{ minHeight: '100vh', backgroundColor: '#0a0a0f', color: '#e2e8f0', fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+      {/* Header */}
+      <header style={{ background: 'linear-gradient(135deg, #1a1a2e, #16213e)', borderBottom: '1px solid rgba(99,102,241,0.2)', padding: '16px 20px', paddingTop: 'max(16px, env(safe-area-inset-top))', position: 'sticky', top: 0, zIndex: 100 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px' }}>🎙️</div>
+            <div>
+              <h1 style={{ fontSize: '18px', fontWeight: '700', margin: 0 }}>Conversation Intelligence</h1>
+              <p style={{ fontSize: '12px', color: mic.permission === 'granted' ? '#10b981' : mic.permission === 'denied' ? '#ef4444' : '#94a3b8', margin: 0 }}>{mic.permission === 'granted' ? '🟢 Microphone ready' : mic.permission === 'denied' ? '🔴 Mic denied - check settings' : mic.permission === 'unavailable' ? '⚠️ Mic unavailable' : '⚪ Tap Enable Mic below'}</p>
+            </div>
+          </div>
+          {recording && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 16px', backgroundColor: paused ? 'rgba(245,158,11,0.2)' : 'rgba(239,68,68,0.2)', borderRadius: '20px', border: `1px solid ${paused ? 'rgba(245,158,11,0.4)' : 'rgba(239,68,68,0.4)'}` }}>
+              <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: paused ? '#f59e0b' : '#ef4444', animation: paused ? 'none' : 'pulse 1.5s infinite' }} />
+              <span style={{ fontSize: '14px', fontWeight: '600' }}>{formatTime(elapsed)}</span>
+            </div>
+          )}
+        </div>
+      </header>
+
+      {/* Tabs */}
+      <nav style={{ display: 'flex', backgroundColor: '#111118', borderBottom: '1px solid rgba(99,102,241,0.1)' }}>
+        {[{ id: 'record', icon: '🎙️', label: 'Record' }, { id: 'analysis', icon: '📊', label: 'Analysis' }, { id: 'history', icon: '📁', label: 'History' }, { id: 'profiles', icon: '👥', label: 'Profiles' }].map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: '14px 8px', backgroundColor: 'transparent', border: 'none', borderBottom: tab === t.id ? '2px solid #6366f1' : '2px solid transparent', color: tab === t.id ? '#e2e8f0' : '#64748b', fontSize: '13px', fontWeight: '600', cursor: 'pointer' }}>{t.icon} {t.label}</button>
+        ))}
+      </nav>
+
+      <main style={{ padding: '20px', paddingBottom: '100px' }}>
+        {/* RECORD TAB */}
+        {tab === 'record' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+            
+            {/* HTTPS Warning */}
+            {mic.permission === 'unavailable' && mic.error?.includes('HTTPS') && (
+              <div style={{ backgroundColor: '#7f1d1d', borderRadius: '16px', padding: '24px', border: '1px solid #ef4444', textAlign: 'center' }}>
+                <div style={{ fontSize: '48px', marginBottom: '16px' }}>🔒</div>
+                <h3 style={{ margin: '0 0 8px', fontSize: '18px', color: '#fca5a5' }}>HTTPS Required</h3>
+                <p style={{ margin: '0 0 16px', fontSize: '14px', color: '#fecaca' }}>
+                  Microphone access requires a secure connection.
+                </p>
+                <div style={{ backgroundColor: '#450a0a', padding: '12px', borderRadius: '8px', fontSize: '13px', color: '#fca5a5' }}>
+                  <strong>To fix:</strong> Host this app on HTTPS or access via <code>localhost</code>
+                </div>
+              </div>
+            )}
+            
+            {/* Mic Permission - Prominent Request */}
+            {mic.permission !== 'granted' && mic.permission !== 'unavailable' && (
+              <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '32px 24px', border: '2px solid rgba(99,102,241,0.5)', textAlign: 'center' }}>
+                <div style={{ fontSize: '64px', marginBottom: '20px' }}>🎤</div>
+                <h3 style={{ margin: '0 0 12px', fontSize: '22px', fontWeight: '700' }}>Enable Microphone</h3>
+                <p style={{ margin: '0 0 24px', fontSize: '15px', color: '#94a3b8', lineHeight: '1.6' }}>
+                  {mic.permission === 'denied' 
+                    ? 'Microphone access was denied. Please enable it in your device settings, then tap below to try again.'
+                    : 'Tap the button below to allow microphone access. This enables voice recording and real-time transcription.'}
+                </p>
+                
+                {mic.error && (
+                  <div style={{ backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '12px', padding: '12px 16px', marginBottom: '20px', textAlign: 'left' }}>
+                    <div style={{ fontSize: '12px', color: '#f87171', fontWeight: '600', marginBottom: '4px' }}>⚠️ Error Details:</div>
+                    <div style={{ fontSize: '13px', color: '#fca5a5' }}>{mic.error}</div>
+                  </div>
+                )}
+                
+                <button 
+                  onClick={mic.requestPermission}
+                  className="mic-pulse"
+                  style={{ 
+                    padding: '18px 48px', 
+                    borderRadius: '16px', 
+                    border: 'none', 
+                    background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', 
+                    color: 'white', 
+                    fontSize: '18px', 
+                    fontWeight: '700', 
+                    cursor: 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '10px',
+                  }}
+                >
+                  🎙️ Allow Microphone Access
+                </button>
+                
+                <p style={{ marginTop: '20px', fontSize: '13px', color: '#64748b' }}>
+                  Your audio is processed locally and never leaves your device.
+                </p>
+                
+                <div style={{ marginTop: '24px', paddingTop: '24px', borderTop: '1px solid rgba(99,102,241,0.2)' }}>
+                  <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '12px' }}>
+                    Don't want to use the microphone?
+                  </p>
+                  <button 
+                    onClick={() => setMode('manual')} 
+                    style={{ padding: '10px 20px', borderRadius: '10px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: 'transparent', color: '#94a3b8', fontSize: '14px', cursor: 'pointer' }}
+                  >
+                    Use Manual Input Instead
+                  </button>
+                </div>
+              </div>
+            )}
+            
+            {/* Mic Permission Granted - Success State */}
+            {mic.permission === 'granted' && !recording && mic.micTestPassed && (
+              <div style={{ backgroundColor: 'rgba(16,185,129,0.1)', borderRadius: '16px', padding: '16px 20px', border: '1px solid rgba(16,185,129,0.3)', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <div style={{ fontSize: '24px' }}>✅</div>
+                <div>
+                  <div style={{ fontSize: '15px', fontWeight: '600', color: '#10b981' }}>Microphone Ready</div>
+                  <div style={{ fontSize: '13px', color: '#6ee7b7' }}>Voice mode enabled - tap record to start</div>
+                </div>
+              </div>
+            )}
+
+            {/* Controls */}
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+              {/* Speaker Select */}
+              <div style={{ marginBottom: '20px' }}>
+                <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '8px', fontWeight: '600', textTransform: 'uppercase' }}>Current Speaker</label>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  {speakers.map(sp => (
+                    <button key={sp} onClick={() => setSpeaker(sp)} style={{ padding: '10px 16px', borderRadius: '10px', border: speaker === sp ? `2px solid ${color(sp)}` : '1px solid rgba(99,102,241,0.3)', backgroundColor: speaker === sp ? `${color(sp)}20` : 'rgba(30,30,40,0.5)', color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
+                      <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', backgroundColor: color(sp), marginRight: '8px' }} />{sp}
+                    </button>
+                  ))}
+                  <button onClick={() => setSpeakers(p => [...p, `Speaker ${p.length + 1}`])} style={{ padding: '10px 16px', borderRadius: '10px', border: '1px dashed rgba(99,102,241,0.4)', backgroundColor: 'transparent', color: '#6366f1', fontSize: '14px', cursor: 'pointer' }}>+ Add</button>
+                </div>
+              </div>
+
+              {/* Mode Toggle */}
+              <div style={{ marginBottom: '20px' }}>
+                <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '8px', fontWeight: '600', textTransform: 'uppercase' }}>Input Mode</label>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button onClick={() => mic.permission === 'granted' ? setMode('voice') : mic.requestPermission()} style={{ flex: 1, padding: '12px', borderRadius: '10px', border: mode === 'voice' ? '2px solid #6366f1' : '1px solid rgba(99,102,241,0.3)', backgroundColor: mode === 'voice' ? 'rgba(99,102,241,0.1)' : 'transparent', color: '#e2e8f0', textAlign: 'left', cursor: 'pointer' }}>
+                    <div style={{ fontWeight: '600', fontSize: '14px' }}>🎙️ Voice {mic.permission === 'granted' && <span style={{ color: '#10b981' }}>✓</span>}</div>
+                    <div style={{ fontSize: '12px', color: '#64748b' }}>{mic.permission === 'granted' ? 'Microphone enabled' : 'Tap to enable'}</div>
+                  </button>
+                  <button onClick={() => setMode('manual')} style={{ flex: 1, padding: '12px', borderRadius: '10px', border: mode === 'manual' ? '2px solid #6366f1' : '1px solid rgba(99,102,241,0.3)', backgroundColor: mode === 'manual' ? 'rgba(99,102,241,0.1)' : 'transparent', color: '#e2e8f0', textAlign: 'left', cursor: 'pointer' }}>
+                    <div style={{ fontWeight: '600', fontSize: '14px' }}>⌨️ Manual</div>
+                    <div style={{ fontSize: '12px', color: '#64748b' }}>Type input</div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Audio Level */}
+              {recording && mode === 'voice' && mic.listening && (
+                <div style={{ marginBottom: '20px' }}>
+                  <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '8px', fontWeight: '600', textTransform: 'uppercase' }}>🎤 Audio Level</label>
+                  <div style={{ height: '12px', backgroundColor: '#1e1e2e', borderRadius: '6px', overflow: 'hidden' }}>
+                    <div style={{ width: `${mic.level}%`, height: '100%', background: mic.level > 70 ? '#ef4444' : mic.level > 40 ? '#f59e0b' : '#10b981', borderRadius: '6px', transition: 'width 0.05s' }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Record Buttons */}
+              <div style={{ display: 'flex', justifyContent: 'center', gap: '16px', marginBottom: '20px' }}>
+                {!recording ? (
+                  <button onClick={startRec} style={{ width: '120px', height: '120px', borderRadius: '50%', border: 'none', background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: 'white', fontSize: '40px', cursor: 'pointer', boxShadow: '0 0 40px rgba(99,102,241,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{mode === 'voice' ? '🎙️' : '▶️'}</button>
+                ) : (
+                  <>
+                    <button onClick={togglePause} style={{ width: '80px', height: '80px', borderRadius: '50%', border: 'none', backgroundColor: paused ? '#10b981' : '#f59e0b', color: 'white', fontSize: '28px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{paused ? '▶️' : '⏸️'}</button>
+                    <button onClick={stopRec} style={{ width: '80px', height: '80px', borderRadius: '50%', border: 'none', backgroundColor: '#ef4444', color: 'white', fontSize: '28px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>⏹️</button>
+                  </>
+                )}
+              </div>
+
+              {/* Status */}
+              {recording && (
+                <div style={{ textAlign: 'center', marginBottom: '16px' }}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 16px', backgroundColor: mic.listening ? 'rgba(16,185,129,0.1)' : 'rgba(245,158,11,0.1)', borderRadius: '20px', fontSize: '14px', color: mic.listening ? '#10b981' : '#f59e0b' }}>
+                    {mode === 'voice' ? (mic.listening ? '● Listening via microphone...' : '⏸️ Paused') : '⌨️ Manual mode'}
+                  </span>
+                </div>
+              )}
+
+              {/* Manual Input */}
+              {recording && mode === 'manual' && (
+                <form onSubmit={(e) => { e.preventDefault(); if (manual.trim()) { addSeg(manual); setManual(''); }}} style={{ display: 'flex', gap: '8px' }}>
+                  <input value={manual} onChange={e => setManual(e.target.value)} placeholder={`Type what ${speaker} said...`} style={{ flex: 1, padding: '14px 16px', borderRadius: '12px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: 'rgba(30,30,40,0.5)', color: '#e2e8f0', fontSize: '16px', outline: 'none' }} />
+                  <button type="submit" style={{ padding: '14px 24px', borderRadius: '12px', border: 'none', backgroundColor: '#6366f1', color: 'white', fontWeight: '600', cursor: 'pointer' }}>Add</button>
+                </form>
+              )}
+
+              {/* Interim */}
+              {recording && mic.listening && mic.interim && (
+                <div style={{ marginTop: '16px', padding: '12px 16px', backgroundColor: 'rgba(99,102,241,0.1)', borderRadius: '10px', borderLeft: '3px solid #6366f1' }}>
+                  <span style={{ fontSize: '12px', color: '#94a3b8' }}>🎤 Hearing...</span>
+                  <p style={{ margin: '4px 0 0', color: '#cbd5e1', fontStyle: 'italic' }}>{mic.interim}</p>
+                </div>
+              )}
+            </div>
+
+            {/* Transcript */}
+            {(recording || segments.length > 0) && (
+              <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '20px', border: '1px solid rgba(99,102,241,0.2)' }}>
+                <h3 style={{ fontSize: '14px', fontWeight: '600', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Live Transcript ({segments.length})</h3>
+                <div ref={scrollRef} style={{ maxHeight: '300px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {segments.map(s => (
+                    <div key={s.id} style={{ padding: '12px 16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '12px', borderLeft: `3px solid ${color(s.speaker)}` }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                        <span style={{ fontWeight: '600', color: color(s.speaker), fontSize: '13px' }}>{s.speaker}</span>
+                        <span style={{ fontSize: '11px', color: '#64748b' }}>{formatTime(s.timestamp)} {emoji(s.sentiment?.label)}</span>
+                      </div>
+                      <p style={{ margin: 0, fontSize: '15px', color: '#e2e8f0' }}>{s.text}</p>
+                    </div>
+                  ))}
+                  {segments.length === 0 && <p style={{ textAlign: 'center', color: '#64748b', padding: '40px 0' }}>{recording ? (mode === 'voice' ? '🎤 Listening...' : '⌨️ Type to add...') : 'No transcript'}</p>}
+                </div>
+              </div>
+            )}
+
+            {/* Insights */}
+            {recording && insights.length > 0 && (
+              <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '20px', border: '1px solid rgba(16,185,129,0.3)' }}>
+                <h3 style={{ fontSize: '14px', fontWeight: '600', color: '#10b981', marginBottom: '16px' }}>🎯 Strategic Intelligence</h3>
+                {insights.map((ins, i) => (
+                  <div key={i} style={{ padding: '12px 16px', backgroundColor: ins.priority === 'high' ? 'rgba(239,68,68,0.1)' : 'rgba(30,30,40,0.5)', borderRadius: '10px', borderLeft: `3px solid ${ins.priority === 'high' ? '#ef4444' : '#10b981'}`, marginBottom: '8px' }}>
+                    <div style={{ fontWeight: '600', fontSize: '13px', color: '#e2e8f0' }}>{ins.type === 'warning' ? '⚠️' : ins.type === 'opportunity' ? '✨' : '🎯'} {ins.message}</div>
+                    <div style={{ fontSize: '13px', color: '#10b981' }}>→ {ins.action}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ANALYSIS TAB */}
+        {tab === 'analysis' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)', textAlign: 'center' }}>
+              <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Overall Sentiment</h3>
+              <div style={{ fontSize: '64px' }}>{emoji(analysis.sentiment.label)}</div>
+              <div style={{ fontSize: '24px', fontWeight: '700', color: sentColor(analysis.sentiment.score) }}>{analysis.sentiment.label.toUpperCase()}</div>
+            </div>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+              <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Speaker Stats</h3>
+              {Object.entries(analysis.stats).map(([sp, st]) => (
+                <div key={sp} style={{ padding: '16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '12px', borderLeft: `3px solid ${color(sp)}`, marginBottom: '12px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}><span style={{ fontWeight: '600', color: color(sp) }}>{sp}</span><span style={{ fontSize: '24px' }}>{emoji(st.sentiment?.label)}</span></div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', textAlign: 'center' }}>
+                    <div><div style={{ fontSize: '18px', fontWeight: '700' }}>{st.count}</div><div style={{ fontSize: '11px', color: '#64748b' }}>Segments</div></div>
+                    <div><div style={{ fontSize: '18px', fontWeight: '700' }}>{st.words}</div><div style={{ fontSize: '11px', color: '#64748b' }}>Words</div></div>
+                    <div><div style={{ fontSize: '18px', fontWeight: '700', color: sentColor(st.sentiment?.score || 0) }}>{Math.round((st.sentiment?.score || 0) * 100)}%</div><div style={{ fontSize: '11px', color: '#64748b' }}>Sentiment</div></div>
+                  </div>
+                </div>
+              ))}
+              {Object.keys(analysis.stats).length === 0 && <p style={{ textAlign: 'center', color: '#64748b' }}>No data yet</p>}
+            </div>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+              <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Topics</h3>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+                {analysis.topics.map((t, i) => (
+                  <span key={i} style={{ padding: '8px 16px', backgroundColor: 'rgba(99,102,241,0.15)', borderRadius: '20px', fontSize: '14px' }}>{t.word} <span style={{ color: '#6366f1' }}>×{t.count}</span></span>
+                ))}
+                {analysis.topics.length === 0 && <p style={{ color: '#64748b', width: '100%', textAlign: 'center' }}>Topics appear as you talk</p>}
+              </div>
+            </div>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+              <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Action Items</h3>
+              {analysis.actions.map((a, i) => (
+                <div key={i} style={{ padding: '12px 16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px', marginBottom: '8px', display: 'flex', gap: '12px' }}>
+                  <span>☐</span><div><p style={{ margin: 0, fontSize: '14px' }}>{a.action}</p><span style={{ fontSize: '12px', color: '#6366f1' }}>{a.owner}</span></div>
+                </div>
+              ))}
+              {analysis.actions.length === 0 && <p style={{ textAlign: 'center', color: '#64748b' }}>Action items extracted automatically</p>}
+            </div>
+          </div>
+        )}
+
+        {/* HISTORY TAB */}
+        {tab === 'history' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            {selected ? (
+              <>
+                <button onClick={() => setSelected(null)} style={{ padding: '10px 16px', backgroundColor: 'transparent', border: '1px solid rgba(99,102,241,0.3)', borderRadius: '10px', color: '#6366f1', fontSize: '14px', cursor: 'pointer', alignSelf: 'flex-start' }}>← Back</button>
+                <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', marginBottom: '20px' }}>
+                    <div><h2 style={{ margin: 0, fontSize: '18px' }}>{formatDate(selected.startTime)}</h2><p style={{ margin: '4px 0 0', fontSize: '14px', color: '#64748b' }}>{formatTime(selected.duration)} • {selected.speakers.join(', ')}</p></div>
+                    <button onClick={() => exportMD(selected)} style={{ padding: '8px 16px', backgroundColor: '#6366f1', border: 'none', borderRadius: '8px', color: 'white', fontSize: '13px', fontWeight: '600', cursor: 'pointer' }}>📄 Export</button>
+                  </div>
+                  <div style={{ padding: '16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '12px', marginBottom: '16px' }}>
+                    <h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Summary</h4>
+                    <p style={{ margin: 0, fontSize: '15px', lineHeight: '1.6' }}>{selected.analysis.summary}</p>
+                  </div>
+                  <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Transcript</h4>
+                  {selected.segments.map(s => (
+                    <div key={s.id} style={{ padding: '12px 16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px', borderLeft: `3px solid ${color(s.speaker)}`, marginBottom: '8px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}><span style={{ fontWeight: '600', color: color(s.speaker), fontSize: '13px' }}>{s.speaker}</span><span style={{ fontSize: '11px', color: '#64748b' }}>{formatTime(s.timestamp)}</span></div>
+                      <p style={{ margin: 0, fontSize: '14px' }}>{s.text}</p>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <h2 style={{ fontSize: '20px', fontWeight: '700', margin: 0 }}>History</h2>
+                <p style={{ fontSize: '14px', color: '#64748b', margin: '0 0 12px' }}>{sessions.length} sessions</p>
+                {sessions.map(s => (
+                  <div key={s.id} onClick={() => setSelected(s)} style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '20px', border: '1px solid rgba(99,102,241,0.2)', cursor: 'pointer' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <div><h3 style={{ margin: '0 0 4px', fontSize: '16px' }}>{formatDate(s.startTime)}</h3><p style={{ margin: 0, fontSize: '13px', color: '#64748b' }}>{formatTime(s.duration)} • {s.speakers.join(', ')}</p></div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <span style={{ fontSize: '24px' }}>{emoji(s.analysis.sentiment.label)}</span>
+                        <button onClick={(e) => { e.stopPropagation(); if (confirm('Delete?')) { const u = sessions.filter(x => x.id !== s.id); setSessions(u); Storage.saveSessions(u); }}} style={{ padding: '6px 10px', backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '6px', color: '#ef4444', fontSize: '12px', cursor: 'pointer' }}>🗑️</button>
+                      </div>
+                    </div>
+                    <p style={{ margin: '12px 0 0', fontSize: '14px', color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{s.analysis.summary}</p>
+                  </div>
+                ))}
+                {sessions.length === 0 && (
+                  <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '60px 20px', border: '1px solid rgba(99,102,241,0.2)', textAlign: 'center' }}>
+                    <div style={{ fontSize: '48px', marginBottom: '16px' }}>📁</div>
+                    <h3 style={{ margin: '0 0 8px' }}>No Sessions Yet</h3>
+                    <p style={{ margin: 0, color: '#64748b', fontSize: '14px' }}>Start recording to save sessions</p>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* PROFILES TAB */}
+        {tab === 'profiles' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <h2 style={{ fontSize: '20px', fontWeight: '700', margin: 0 }}>Speaker Profiles</h2>
+            <p style={{ fontSize: '14px', color: '#64748b', margin: '0 0 12px' }}>Built from conversation analysis</p>
+            {Object.entries(profiles).map(([name, p]) => (
+              <div key={p.id} style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+                  <div style={{ width: '56px', height: '56px', borderRadius: '50%', backgroundColor: color(name), display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px', fontWeight: '700', color: 'white' }}>{name.charAt(0)}</div>
+                  <div><h3 style={{ margin: 0, fontSize: '18px' }}>{name}</h3><p style={{ margin: '4px 0 0', fontSize: '13px', color: '#64748b' }}>{p.sessions?.length || 0} sessions</p></div>
+                </div>
+                {p.communicationStyle && Object.keys(p.communicationStyle).length > 0 && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Style</h4>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px' }}>
+                      {['assertiveness', 'directnessLevel', 'collaborativeIndex'].map(k => (
+                        <div key={k}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}><span style={{ fontSize: '12px', color: '#94a3b8' }}>{k.replace(/([A-Z])/g, ' $1').trim()}</span><span style={{ fontSize: '12px', fontWeight: '600' }}>{p.communicationStyle[k] || 0}%</span></div>
+                          <div style={{ height: '6px', backgroundColor: '#1e1e2e', borderRadius: '3px', overflow: 'hidden' }}><div style={{ width: `${p.communicationStyle[k] || 0}%`, height: '100%', backgroundColor: '#6366f1', borderRadius: '3px' }} /></div>
+                        </div>
+                      ))}
+                      <div><span style={{ fontSize: '12px', color: '#94a3b8' }}>Pace</span><div style={{ marginTop: '4px', padding: '6px 12px', backgroundColor: 'rgba(99,102,241,0.15)', borderRadius: '6px', fontSize: '13px', display: 'inline-block', textTransform: 'capitalize' }}>{p.communicationStyle.preferredPace || 'Unknown'}</div></div>
+                    </div>
+                  </div>
+                )}
+                {p.strategicNotes && (
+                  <div style={{ padding: '16px', backgroundColor: 'rgba(16,185,129,0.1)', borderRadius: '12px', borderLeft: '3px solid #10b981' }}>
+                    <h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#10b981' }}>🎯 Strategic Notes</h4>
+                    <p style={{ margin: 0, fontSize: '14px', lineHeight: '1.5' }}>{p.strategicNotes}</p>
+                  </div>
+                )}
+              </div>
+            ))}
+            {Object.keys(profiles).length === 0 && (
+              <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '60px 20px', border: '1px solid rgba(99,102,241,0.2)', textAlign: 'center' }}>
+                <div style={{ fontSize: '48px', marginBottom: '16px' }}>👥</div>
+                <h3 style={{ margin: '0 0 8px' }}>No Profiles Yet</h3>
+                <p style={{ margin: 0, color: '#64748b', fontSize: '14px' }}>Profiles build automatically from conversations</p>
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+
+      <style>{`
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        input:focus, button:focus { outline: none; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.3); border-radius: 3px; }
+      `}</style>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
