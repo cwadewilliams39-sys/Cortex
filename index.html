@@ -9,8 +9,6 @@
   <meta name="theme-color" content="#0a0a0f">
   <title>Conversation Intelligence</title>
   
-  <link rel="manifest" href="manifest.json">
-  
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body, #root { height: 100%; width: 100%; overflow: hidden; }
@@ -28,24 +26,21 @@
         padding-bottom: max(0px, env(safe-area-inset-bottom));
       }
     }
-    
     @keyframes mic-pulse {
       0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7); }
       50% { box-shadow: 0 0 0 20px rgba(99, 102, 241, 0); }
     }
     .mic-pulse { animation: mic-pulse 2s infinite; }
-    
-    @keyframes slideIn {
-      from { transform: translateY(-10px); opacity: 0; }
-      to { transform: translateY(0); opacity: 1; }
-    }
-    .slide-in { animation: slideIn 0.3s ease-out; }
-    
     @keyframes pulse-soft {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.6; }
     }
     .pulse-soft { animation: pulse-soft 2s ease-in-out infinite; }
+    @keyframes speaker-flash {
+      0% { background-color: rgba(16, 185, 129, 0.3); }
+      100% { background-color: transparent; }
+    }
+    .speaker-flash { animation: speaker-flash 0.5s ease-out; }
   </style>
   
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
@@ -56,12 +51,10 @@
   <div id="root"></div>
   
   <script type="text/babel" data-type="module">
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const { useState, useEffect, useRef, useCallback } = React;
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-const isSecureContext = () => window.isSecureContext || location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+// Utilities
+const isSecureContext = () => window.isSecureContext || location.protocol === 'https:' || location.hostname === 'localhost';
 const hasGetUserMedia = () => !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 const generateId = () => crypto.randomUUID?.() || Math.random().toString(36).substr(2, 9);
 const formatTime = (ms) => {
@@ -71,13 +64,132 @@ const formatTime = (ms) => {
 const formatDate = (d) => new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 
 // ============================================================================
-// ENHANCED NLP ENGINE
+// SPEAKER DIARIZATION - Voice Fingerprinting Engine
+// ============================================================================
+const SpeakerDiarization = {
+  profiles: [],
+  
+  // Extract voice features from audio analyser
+  extractFeatures: (analyser) => {
+    const frequencyData = new Uint8Array(analyser.frequencyBinCount);
+    const timeData = new Uint8Array(analyser.fftSize);
+    analyser.getByteFrequencyData(frequencyData);
+    analyser.getByteTimeDomainData(timeData);
+    
+    // Energy (volume)
+    let energy = 0;
+    for (let i = 0; i < frequencyData.length; i++) {
+      energy += frequencyData[i] * frequencyData[i];
+    }
+    energy = Math.sqrt(energy / frequencyData.length);
+    
+    // Spectral centroid (brightness/timbre)
+    let weightedSum = 0, sum = 0;
+    for (let i = 0; i < frequencyData.length; i++) {
+      weightedSum += i * frequencyData[i];
+      sum += frequencyData[i];
+    }
+    const spectralCentroid = sum > 0 ? weightedSum / sum : 0;
+    
+    // Spectral rolloff (where most energy is)
+    const totalEnergy = frequencyData.reduce((a, b) => a + b, 0);
+    let cumulativeEnergy = 0, rolloff = 0;
+    for (let i = 0; i < frequencyData.length; i++) {
+      cumulativeEnergy += frequencyData[i];
+      if (cumulativeEnergy >= totalEnergy * 0.85) { rolloff = i; break; }
+    }
+    
+    // Zero crossing rate (voice texture)
+    let zeroCrossings = 0;
+    for (let i = 1; i < timeData.length; i++) {
+      if ((timeData[i] >= 128 && timeData[i - 1] < 128) || (timeData[i] < 128 && timeData[i - 1] >= 128)) {
+        zeroCrossings++;
+      }
+    }
+    const zcr = zeroCrossings / timeData.length;
+    
+    // Estimate pitch via autocorrelation
+    const sampleRate = 44100;
+    const minPeriod = Math.floor(sampleRate / 500); // max 500Hz
+    const maxPeriod = Math.floor(sampleRate / 80);  // min 80Hz
+    let bestCorrelation = 0, bestPeriod = 0;
+    const centered = Array.from(timeData).map(v => v - 128);
+    for (let period = minPeriod; period < Math.min(maxPeriod, centered.length / 2); period++) {
+      let correlation = 0;
+      for (let i = 0; i < centered.length - period; i++) {
+        correlation += centered[i] * centered[i + period];
+      }
+      correlation /= (centered.length - period);
+      if (correlation > bestCorrelation) { bestCorrelation = correlation; bestPeriod = period; }
+    }
+    const pitch = bestPeriod > 0 ? sampleRate / bestPeriod : 0;
+    
+    // Band energies (low/mid/high voice characteristics)
+    const third = Math.floor(frequencyData.length / 3);
+    const lowBand = frequencyData.slice(0, third).reduce((a, b) => a + b, 0) / third;
+    const midBand = frequencyData.slice(third, third * 2).reduce((a, b) => a + b, 0) / third;
+    const highBand = frequencyData.slice(third * 2).reduce((a, b) => a + b, 0) / (frequencyData.length - third * 2);
+    
+    return { energy, spectralCentroid, rolloff, zcr, pitch, lowBand, midBand, highBand };
+  },
+  
+  // Calculate distance between two voice profiles
+  calculateDistance: (f1, f2) => {
+    if (!f1 || !f2) return Infinity;
+    const weights = { spectralCentroid: 2.0, pitch: 3.0, rolloff: 1.5, zcr: 1.0, lowBand: 1.5, midBand: 1.0, highBand: 1.5 };
+    const normalizers = { spectralCentroid: 100, pitch: 200, rolloff: 50, zcr: 0.2, lowBand: 50, midBand: 50, highBand: 50 };
+    let distance = 0;
+    for (const key of Object.keys(weights)) {
+      const diff = (f1[key] || 0) - (f2[key] || 0);
+      distance += weights[key] * Math.pow(diff / (normalizers[key] || 1), 2);
+    }
+    return Math.sqrt(distance);
+  },
+  
+  // Identify speaker from features, create new profile if needed
+  identifySpeaker: (features, threshold = 2.5) => {
+    if (!features || features.energy < 5) return null; // silence
+    
+    let bestMatch = null, bestDistance = Infinity;
+    for (const profile of SpeakerDiarization.profiles) {
+      const distance = SpeakerDiarization.calculateDistance(features, profile.avgFeatures);
+      if (distance < bestDistance) { bestDistance = distance; bestMatch = profile; }
+    }
+    
+    if (bestMatch && bestDistance < threshold) {
+      // Update running average
+      const n = bestMatch.sampleCount;
+      for (const key of Object.keys(bestMatch.avgFeatures)) {
+        if (typeof features[key] === 'number') {
+          bestMatch.avgFeatures[key] = (bestMatch.avgFeatures[key] * n + features[key]) / (n + 1);
+        }
+      }
+      bestMatch.sampleCount++;
+      return bestMatch.id;
+    }
+    
+    // Create new speaker profile
+    const newProfile = {
+      id: `Speaker ${SpeakerDiarization.profiles.length + 1}`,
+      avgFeatures: { ...features },
+      sampleCount: 1
+    };
+    SpeakerDiarization.profiles.push(newProfile);
+    return newProfile.id;
+  },
+  
+  reset: () => { SpeakerDiarization.profiles = []; },
+  getSpeakers: () => SpeakerDiarization.profiles.map(p => p.id),
+  getSpeakerCount: () => SpeakerDiarization.profiles.length
+};
+
+// ============================================================================
+// NLP ENGINE
 // ============================================================================
 const NLP = {
-  // ==================== BASIC ANALYSIS ====================
   sentiment: (text) => {
-    const pos = ['great','good','excellent','amazing','wonderful','fantastic','love','happy','agree','yes','perfect','brilliant','awesome','pleased','excited','opportunity','success','win','benefit','definitely','absolutely','exactly','right','confident','optimistic','enthusiastic'];
-    const neg = ['bad','terrible','awful','hate','disagree','no','wrong','problem','issue','concern','worried','frustrated','disappointed','unfortunately','difficult','impossible','fail','risk','threat','never','confused','unclear','uncertain','skeptical','doubt'];
+    const pos = ['great','good','excellent','amazing','wonderful','love','happy','agree','yes','perfect','awesome','excited','success','win','definitely','absolutely'];
+    const neg = ['bad','terrible','awful','hate','disagree','no','wrong','problem','issue','concern','worried','frustrated','disappointed','difficult','fail','risk'];
     const words = text.toLowerCase().split(/\W+/);
     let score = 0;
     words.forEach(w => { if (pos.includes(w)) score += 1; if (neg.includes(w)) score -= 1; });
@@ -86,393 +198,29 @@ const NLP = {
   },
 
   topics: (text) => {
-    const stop = new Set(['the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be','been','have','has','had','do','does','did','will','would','could','should','that','this','these','those','i','you','he','she','it','we','they','what','which','who','when','where','why','how','all','each','every','both','few','more','most','other','some','no','not','only','so','than','too','very','just','can','my','your','our','their','its','about','into','through','during','before','after','again','then','here','there','any','also','well','now','get','got','like','know','think','want','need','going','thing','things','yeah','okay','right','sure','mean','really','actually','basically','something']);
+    const stop = new Set(['the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be','been','have','has','had','do','does','did','will','would','could','should','that','this','i','you','he','she','it','we','they','what','which','who','when','where','why','how','all','some','no','not','only','so','than','too','very','just','can','my','your','our','their','about','into','through','during','before','after','again','then','here','there','also','well','now','get','like','know','think','want','need','going','thing','things','yeah','okay','right','sure','mean','really','actually','something']);
     const words = text.toLowerCase().split(/\W+/).filter(w => w.length > 3 && !stop.has(w));
     const freq = {};
     words.forEach(w => freq[w] = (freq[w] || 0) + 1);
-    return Object.entries(freq).filter(([_,c]) => c >= 2).sort((a,b) => b[1] - a[1]).slice(0, 10).map(([word, count]) => ({ word, count, firstMention: null }));
+    return Object.entries(freq).filter(([_,c]) => c >= 2).sort((a,b) => b[1] - a[1]).slice(0, 8).map(([word, count]) => ({ word, count }));
   },
 
-  questions: (text) => {
-    return text.split(/[.!?]+/).filter(s => /^(what|who|where|when|why|how|is|are|was|were|do|does|did|can|could|would|should|will|have|has)\b/i.test(s.trim()) || s.includes('?')).map(s => ({ text: s.trim() + (s.includes('?') ? '' : '?'), resolved: false }));
-  },
+  questions: (text) => text.split(/[.!?]+/).filter(s => /^(what|who|where|when|why|how|is|are|was|were|do|does|did|can|could|would|should|will|have|has)\b/i.test(s.trim()) || s.includes('?')).map(s => s.trim()),
 
   actions: (text, speaker) => {
-    const patterns = [
-      /(?:i will|i'll|we will|we'll|going to)\s+(.+?)(?:\.|$)/gi,
-      /(?:need to|have to|should)\s+(.+?)(?:\.|$)/gi,
-      /(?:let me|let's)\s+(.+?)(?:\.|$)/gi,
-      /(?:i can|i could)\s+(.+?)(?:\.|$)/gi
-    ];
+    const patterns = [/(?:i will|i'll|we will|we'll|going to)\s+(.+?)(?:\.|$)/gi, /(?:need to|have to|should)\s+(.+?)(?:\.|$)/gi, /(?:let me|let's)\s+(.+?)(?:\.|$)/gi];
     const items = [];
-    patterns.forEach(p => {
-      let m;
-      while ((m = p.exec(text)) !== null) {
-        if (m[1].length > 10 && m[1].length < 200) {
-          // Check for deadline mentions
-          const hasDeadline = /(?:by|before|until|tomorrow|monday|tuesday|wednesday|thursday|friday|next week|end of|eod|eow)/i.test(m[1]);
-          items.push({
-            id: generateId(),
-            action: m[1].trim(),
-            owner: speaker || 'Unassigned',
-            hasDeadline,
-            commitmentStrength: /(?:will|definitely|promise|commit)/i.test(text) ? 'strong' : 'tentative'
-          });
-        }
-      }
-    });
+    patterns.forEach(p => { let m; while ((m = p.exec(text)) !== null) { if (m[1].length > 10 && m[1].length < 200) items.push({ id: generateId(), action: m[1].trim(), owner: speaker || 'Unassigned' }); }});
     return items;
   },
 
   decisions: (text) => {
-    const patterns = [
-      /(?:we decided|agreed to|decision is|we're going with|final decision)\s+(.+?)(?:\.|$)/gi,
-      /(?:let's go with|going with|we'll do|we will do)\s+(.+?)(?:\.|$)/gi,
-      /(?:that's settled|it's decided|confirmed that)\s+(.+?)(?:\.|$)/gi
-    ];
+    const patterns = [/(?:we decided|agreed to|decision is)\s+(.+?)(?:\.|$)/gi, /(?:let's go with|going with)\s+(.+?)(?:\.|$)/gi];
     const items = [];
-    patterns.forEach(p => { let m; while ((m = p.exec(text)) !== null) items.push({ text: m[1].trim(), timestamp: Date.now() }); });
+    patterns.forEach(p => { let m; while ((m = p.exec(text)) !== null) items.push(m[1].trim()); });
     return items;
   },
 
-  // ==================== INFLUENCE TACTICS DETECTION ====================
-  influenceTactics: (text, speaker) => {
-    const tactics = [];
-    const lower = text.toLowerCase();
-    
-    // Rational Persuasion (data, logic, evidence)
-    const rationalPatterns = [
-      /(?:data shows|research indicates|evidence suggests|statistics show|numbers indicate)/i,
-      /(?:according to|based on|the results|analysis shows|metrics indicate)/i,
-      /(?:logically|therefore|consequently|thus|hence|it follows)/i,
-      /(?:\d+%|\d+ percent|roi|kpi|benchmark)/i,
-      /(?:study found|survey shows|report indicates)/i
-    ];
-    if (rationalPatterns.some(p => p.test(text))) {
-      tactics.push({ type: 'rational_persuasion', speaker, confidence: 'high', description: 'Using data, logic, or evidence' });
-    }
-    
-    // Consultation (asking for input)
-    const consultationPatterns = [
-      /(?:what do you think|your thoughts|your opinion|how do you see)/i,
-      /(?:i'd like your input|want your feedback|your perspective)/i,
-      /(?:before we decide|before finalizing|let's discuss)/i,
-      /(?:does anyone have|any concerns|any objections)/i
-    ];
-    if (consultationPatterns.some(p => p.test(text))) {
-      tactics.push({ type: 'consultation', speaker, confidence: 'high', description: 'Seeking input before deciding' });
-    }
-    
-    // Inspirational Appeals (vision, values, emotions)
-    const inspirationalPatterns = [
-      /(?:imagine|vision|future|transform|revolutionary|game.?changer)/i,
-      /(?:exciting|amazing opportunity|incredible|breakthrough)/i,
-      /(?:our mission|our values|what we stand for|why we're here)/i,
-      /(?:make a difference|change the world|impact lives)/i
-    ];
-    if (inspirationalPatterns.some(p => p.test(text))) {
-      tactics.push({ type: 'inspirational_appeal', speaker, confidence: 'high', description: 'Appealing to vision or values' });
-    }
-    
-    // Coalition Building ("we" language, alliance signals)
-    const weCount = (text.match(/\bwe\b/gi) || []).length;
-    const togetherPatterns = [
-      /(?:together|as a team|collectively|all of us)/i,
-      /(?:shared goal|common objective|aligned on)/i,
-      /(?:partner with|collaborate|join forces)/i
-    ];
-    if (weCount >= 2 || togetherPatterns.some(p => p.test(text))) {
-      tactics.push({ type: 'coalition_building', speaker, confidence: weCount >= 3 ? 'high' : 'medium', description: 'Building alliances, using "we" language' });
-    }
-    
-    // Legitimating (referencing authority, policy, precedent)
-    const legitimatingPatterns = [
-      /(?:policy requires|regulation states|compliance|governance)/i,
-      /(?:leadership decided|executive direction|mandate)/i,
-      /(?:precedent|we've always|standard practice|best practice)/i,
-      /(?:ceo said|vp mentioned|leadership wants)/i
-    ];
-    if (legitimatingPatterns.some(p => p.test(text))) {
-      tactics.push({ type: 'legitimating', speaker, confidence: 'high', description: 'Referencing authority or policy' });
-    }
-    
-    // Personal Appeals (relationship-based)
-    const personalPatterns = [
-      /(?:as a favor|i need your help|help me out)/i,
-      /(?:i'm counting on you|trust you|rely on you)/i,
-      /(?:between us|off the record|personally)/i,
-      /(?:our relationship|we've worked together)/i
-    ];
-    if (personalPatterns.some(p => p.test(text))) {
-      tactics.push({ type: 'personal_appeal', speaker, confidence: 'medium', description: 'Relationship-based request' });
-    }
-    
-    return tactics;
-  },
-
-  // ==================== STAKEHOLDER ALIGNMENT ====================
-  alignmentSignals: (text, speaker) => {
-    const signals = {
-      agreement: [],
-      resistance: [],
-      commitment: null,
-      gaps: []
-    };
-    
-    // Agreement markers
-    const agreementPatterns = [
-      { pattern: /\bi agree\b/i, strength: 'strong' },
-      { pattern: /\bthat makes sense\b/i, strength: 'strong' },
-      { pattern: /\bexactly\b/i, strength: 'strong' },
-      { pattern: /\babsolutely\b/i, strength: 'strong' },
-      { pattern: /\byou're right\b/i, strength: 'strong' },
-      { pattern: /\bgood point\b/i, strength: 'medium' },
-      { pattern: /\bi see\b/i, strength: 'weak' },
-      { pattern: /\bokay\b/i, strength: 'weak' },
-      { pattern: /\bfair enough\b/i, strength: 'medium' }
-    ];
-    agreementPatterns.forEach(({ pattern, strength }) => {
-      if (pattern.test(text)) signals.agreement.push({ speaker, strength });
-    });
-    
-    // Resistance markers
-    const resistancePatterns = [
-      { pattern: /\bbut\b(?!\s+also)/i, type: 'objection' },
-      { pattern: /\bhowever\b/i, type: 'objection' },
-      { pattern: /\bi'm not sure\b/i, type: 'uncertainty' },
-      { pattern: /\bconcerned\b/i, type: 'concern' },
-      { pattern: /\bworried\b/i, type: 'concern' },
-      { pattern: /\bpushback\b/i, type: 'resistance' },
-      { pattern: /\bi disagree\b/i, type: 'disagreement' },
-      { pattern: /\bdon't think\b/i, type: 'disagreement' },
-      { pattern: /\bproblematic\b/i, type: 'concern' },
-      { pattern: /\brisk\b/i, type: 'concern' },
-      { pattern: /\bdifficult\b/i, type: 'concern' }
-    ];
-    resistancePatterns.forEach(({ pattern, type }) => {
-      if (pattern.test(text)) signals.resistance.push({ speaker, type });
-    });
-    
-    // Commitment levels
-    if (/\bi will\b|\bi commit\b|\bi promise\b|\bdefinitely will\b/i.test(text)) {
-      signals.commitment = { speaker, level: 'strong' };
-    } else if (/\bi might\b|\bwe could consider\b|\bpossibly\b|\bmaybe\b/i.test(text)) {
-      signals.commitment = { speaker, level: 'tentative' };
-    }
-    
-    // Questions indicating gaps
-    if (/\bi don't understand\b|\bcan you clarify\b|\bwhat do you mean\b|\bconfused about\b/i.test(text)) {
-      signals.gaps.push({ speaker, type: 'understanding' });
-    }
-    if (/\bwhy would we\b|\bwhy not\b|\bwhat's the reason\b/i.test(text)) {
-      signals.gaps.push({ speaker, type: 'rationale' });
-    }
-    
-    return signals;
-  },
-
-  // ==================== POWER DYNAMICS ====================
-  powerDynamics: (segments) => {
-    const speakingTime = {};
-    const responsePatterns = {};
-    const deferenceMarkers = [];
-    
-    segments.forEach((seg, i) => {
-      // Speaking time distribution
-      const words = seg.text.split(/\s+/).length;
-      speakingTime[seg.speaker] = (speakingTime[seg.speaker] || 0) + words;
-      
-      // Who responds to whom
-      if (i > 0) {
-        const prev = segments[i - 1].speaker;
-        if (prev !== seg.speaker) {
-          if (!responsePatterns[seg.speaker]) responsePatterns[seg.speaker] = {};
-          responsePatterns[seg.speaker][prev] = (responsePatterns[seg.speaker][prev] || 0) + 1;
-        }
-      }
-      
-      // Deference markers
-      if (/\bwhat do you think\b|\bi defer to\b|\byour call\b|\byou decide\b/i.test(seg.text)) {
-        deferenceMarkers.push({ from: seg.speaker, timestamp: seg.timestamp });
-      }
-    });
-    
-    const totalWords = Object.values(speakingTime).reduce((a, b) => a + b, 0);
-    const distribution = {};
-    Object.entries(speakingTime).forEach(([sp, words]) => {
-      distribution[sp] = Math.round((words / totalWords) * 100);
-    });
-    
-    return { speakingTime: distribution, responsePatterns, deferenceMarkers };
-  },
-
-  // ==================== MEETING EFFECTIVENESS ====================
-  meetingEffectiveness: (segments, topics, decisions, actions) => {
-    const metrics = {
-      productivity: {},
-      health: {},
-      alerts: []
-    };
-    
-    if (segments.length === 0) return metrics;
-    
-    // Decision velocity (simplified - time to first decision)
-    const firstDecisionTime = decisions.length > 0 ? decisions[0].timestamp : null;
-    const meetingStart = segments[0]?.timestamp || 0;
-    metrics.productivity.decisionVelocity = firstDecisionTime ? 
-      Math.round((firstDecisionTime - meetingStart) / 60000) : null;
-    
-    // Action item clarity
-    const actionsWithOwners = actions.filter(a => a.owner && a.owner !== 'Unassigned').length;
-    const actionsWithDeadlines = actions.filter(a => a.hasDeadline).length;
-    metrics.productivity.actionClarity = actions.length > 0 ? 
-      Math.round(((actionsWithOwners + actionsWithDeadlines) / (actions.length * 2)) * 100) : 100;
-    
-    // Participation balance
-    const powerData = NLP.powerDynamics(segments);
-    const distribution = Object.values(powerData.speakingTime);
-    const avgParticipation = distribution.reduce((a, b) => a + b, 0) / distribution.length;
-    const variance = distribution.reduce((sum, val) => sum + Math.pow(val - avgParticipation, 2), 0) / distribution.length;
-    metrics.productivity.participationBalance = Math.max(0, 100 - Math.round(Math.sqrt(variance)));
-    
-    // Meeting health signals
-    const allText = segments.map(s => s.text).join(' ');
-    const questions = NLP.questions(allText);
-    const statements = allText.split(/[.!]+/).filter(s => s.trim().length > 5 && !s.includes('?')).length;
-    metrics.health.questionRatio = statements > 0 ? 
-      Math.round((questions.length / (questions.length + statements)) * 100) : 0;
-    
-    // Forward vs backward looking
-    const forwardPatterns = /\bwill\b|\bgoing to\b|\bplan to\b|\bnext\b|\bfuture\b|\bupcoming\b/gi;
-    const backwardPatterns = /\bwas\b|\bwere\b|\bdid\b|\bpreviously\b|\blast\b|\bhistorically\b/gi;
-    const forwardCount = (allText.match(forwardPatterns) || []).length;
-    const backwardCount = (allText.match(backwardPatterns) || []).length;
-    metrics.health.forwardLooking = forwardCount + backwardCount > 0 ?
-      Math.round((forwardCount / (forwardCount + backwardCount)) * 100) : 50;
-    
-    // Problem vs solution focus
-    const problemPatterns = /\bproblem\b|\bissue\b|\bchallenge\b|\bdifficulty\b|\bfailing\b|\bbroken\b/gi;
-    const solutionPatterns = /\bsolution\b|\bfix\b|\bresolve\b|\bimprove\b|\bopportunity\b|\bapproach\b/gi;
-    const problemCount = (allText.match(problemPatterns) || []).length;
-    const solutionCount = (allText.match(solutionPatterns) || []).length;
-    metrics.health.solutionFocus = problemCount + solutionCount > 0 ?
-      Math.round((solutionCount / (problemCount + solutionCount)) * 100) : 50;
-    
-    return metrics;
-  },
-
-  // ==================== PM-SPECIFIC PATTERNS ====================
-  pmPatterns: (text, speaker) => {
-    const patterns = {
-      prioritization: [],
-      requirements: [],
-      scopeCreep: [],
-      ambiguity: []
-    };
-    
-    // Trade-off language
-    if (/\bif we do\b.*\bcan't\b|\btrade.?off\b|\beither.*or\b|\bprioritize\b/i.test(text)) {
-      patterns.prioritization.push({ type: 'tradeoff', speaker, text: text.substring(0, 100) });
-    }
-    
-    // Scope creep signals
-    const scopeCreepPatterns = [
-      /\bwe should also\b/i,
-      /\bwhile we're at it\b/i,
-      /\bwouldn't it be nice\b/i,
-      /\bcan we also\b/i,
-      /\bjust add\b/i,
-      /\bquick addition\b/i,
-      /\bsmall change\b/i
-    ];
-    scopeCreepPatterns.forEach(p => {
-      if (p.test(text)) {
-        patterns.scopeCreep.push({ speaker, signal: text.substring(0, 80), timestamp: Date.now() });
-      }
-    });
-    
-    // Urgency vs importance
-    if (/\burgent\b|\basap\b|\bimmediately\b|\bfire\b|\bcritical\b/i.test(text)) {
-      patterns.prioritization.push({ type: 'urgency', speaker });
-    }
-    if (/\bimportant\b|\bstrategic\b|\blong.?term\b|\bfoundational\b/i.test(text)) {
-      patterns.prioritization.push({ type: 'importance', speaker });
-    }
-    
-    // Ambiguous language
-    const ambiguousPatterns = [
-      { pattern: /\bsomehow\b/i, term: 'somehow' },
-      { pattern: /\bwhatever works\b/i, term: 'whatever works' },
-      { pattern: /\btbd\b/i, term: 'TBD' },
-      { pattern: /\bfigure it out\b/i, term: 'figure it out' },
-      { pattern: /\bsome kind of\b/i, term: 'some kind of' },
-      { pattern: /\bmaybe\b/i, term: 'maybe' },
-      { pattern: /\bprobably\b/i, term: 'probably' },
-      { pattern: /\bit depends\b/i, term: 'it depends' }
-    ];
-    ambiguousPatterns.forEach(({ pattern, term }) => {
-      if (pattern.test(text)) {
-        patterns.ambiguity.push({ speaker, term, context: text.substring(0, 80) });
-      }
-    });
-    
-    // Resource constraints
-    if (/\bbudget\b|\bresources\b|\bheadcount\b|\bbandwidth\b|\bcapacity\b/i.test(text)) {
-      patterns.prioritization.push({ type: 'resource_constraint', speaker });
-    }
-    
-    return patterns;
-  },
-
-  // ==================== NEGOTIATION DYNAMICS ====================
-  negotiationDynamics: (text, speaker, segments) => {
-    const dynamics = {
-      positions: [],
-      concessions: [],
-      anchors: [],
-      batna: [],
-      framing: null,
-      commitments: [],
-      reciprocity: []
-    };
-    
-    // Anchoring (first numbers mentioned)
-    const numbers = text.match(/\$[\d,]+|\d+%|\d+ (?:days|weeks|months|hours|dollars|units)/gi);
-    if (numbers) {
-      numbers.forEach(n => dynamics.anchors.push({ speaker, value: n }));
-    }
-    
-    // BATNA references (alternatives)
-    if (/\balternative\b|\botherwise\b|\bif not\b|\bother option\b|\bplan b\b|\bfallback\b/i.test(text)) {
-      dynamics.batna.push({ speaker, mention: text.substring(0, 80) });
-    }
-    
-    // Concession patterns
-    if (/\bi can give\b|\bi'll compromise\b|\bwe can adjust\b|\bfine, we'll\b|\bokay, we can\b/i.test(text)) {
-      dynamics.concessions.push({ speaker, signal: text.substring(0, 80) });
-    }
-    
-    // Win-win vs zero-sum framing
-    if (/\bmutual benefit\b|\bwin.?win\b|\bboth gain\b|\bshared value\b/i.test(text)) {
-      dynamics.framing = 'collaborative';
-    } else if (/\bnon.?negotiable\b|\bmust have\b|\bfinal offer\b|\btake it or\b/i.test(text)) {
-      dynamics.framing = 'competitive';
-    }
-    
-    // Commitment devices
-    if (/\bi promise\b|\byou have my word\b|\bi commit\b|\bi guarantee\b/i.test(text)) {
-      dynamics.commitments.push({ speaker, text: text.substring(0, 80) });
-    }
-    
-    // Reciprocity patterns
-    if (/\bif you\b.*\bi'll\b|\bif we\b.*\bthen you\b|\bin exchange\b|\bquid pro quo\b/i.test(text)) {
-      dynamics.reciprocity.push({ speaker, text: text.substring(0, 80) });
-    }
-    
-    return dynamics;
-  },
-
-  // ==================== ENHANCED STYLE ANALYSIS ====================
   style: (segs) => {
     const text = segs.map(s => s.text).join(' ');
     const words = text.split(/\s+/);
@@ -480,260 +228,36 @@ const NLP = {
     const avg = words.length / Math.max(sentences.length, 1);
     const iCount = (text.match(/\bi\b/gi) || []).length;
     const weCount = (text.match(/\bwe\b/gi) || []).length;
-    
-    // Data-driven vs intuition-driven
-    const dataPatterns = /\bdata\b|\bmetrics\b|\bnumbers\b|\bstatistics\b|\bresearch\b|\bevidence\b|\banalysis\b/gi;
-    const intuitionPatterns = /\bi feel\b|\bi think\b|\bmy gut\b|\bintuition\b|\bsense that\b/gi;
-    const dataCount = (text.match(dataPatterns) || []).length;
-    const intuitionCount = (text.match(intuitionPatterns) || []).length;
-    const dataDriven = dataCount + intuitionCount > 0 ? 
-      Math.round((dataCount / (dataCount + intuitionCount)) * 100) : 50;
-    
-    // Detail-oriented vs big-picture
-    const detailPatterns = /\bspecifically\b|\bexactly\b|\bprecisely\b|\bstep by step\b|\bin detail\b/gi;
-    const bigPicturePatterns = /\boverall\b|\bin general\b|\bbig picture\b|\bstrategically\b|\bbroad\b/gi;
-    const detailCount = (text.match(detailPatterns) || []).length;
-    const bigPictureCount = (text.match(bigPicturePatterns) || []).length;
-    const detailOriented = detailCount + bigPictureCount > 0 ?
-      Math.round((detailCount / (detailCount + bigPictureCount)) * 100) : 50;
-    
-    // Risk tolerance (hedging frequency)
-    const hedgingPatterns = /\bmaybe\b|\bperhaps\b|\bmight\b|\bcould\b|\bpossibly\b|\bpotentially\b/gi;
-    const confidentPatterns = /\bdefinitely\b|\bcertainly\b|\babsolutely\b|\bwill\b|\bmust\b/gi;
-    const hedgeCount = (text.match(hedgingPatterns) || []).length;
-    const confidentCount = (text.match(confidentPatterns) || []).length;
-    const riskTolerance = hedgeCount + confidentCount > 0 ?
-      Math.round((confidentCount / (hedgeCount + confidentCount)) * 100) : 50;
-    
-    // Decision-making style
-    const quickDecisionPatterns = /\blet's just\b|\bdecide now\b|\bmove forward\b|\bdon't overthink\b/gi;
-    const deliberativePatterns = /\blet's think\b|\bconsider\b|\bweigh options\b|\btake time\b|\banalyze\b/gi;
-    const quickCount = (text.match(quickDecisionPatterns) || []).length;
-    const deliberativeCount = (text.match(deliberativePatterns) || []).length;
-    
     return {
       assertiveness: Math.min(100, Math.round((text.match(/!/g) || []).length * 10 + (iCount / words.length * 500))),
       directnessLevel: Math.min(100, Math.round(100 - avg * 3)),
       collaborativeIndex: Math.round(weCount / Math.max(iCount + weCount, 1) * 100),
-      preferredPace: avg < 10 ? 'fast' : avg > 20 ? 'slow' : 'moderate',
-      dataDriven,
-      detailOriented,
-      riskTolerance,
-      decisionStyle: quickCount > deliberativeCount ? 'quick' : deliberativeCount > quickCount ? 'deliberative' : 'balanced'
+      preferredPace: avg < 10 ? 'fast' : avg > 20 ? 'slow' : 'moderate'
     };
   },
 
-  // ==================== EXECUTIVE SUMMARY ====================
-  executiveSummary: (segments, topics, decisions, actions, currentSpeaker) => {
-    const summary = {
-      topThree: [],
-      decisionCount: decisions.length,
-      decisionList: decisions.slice(0, 5),
-      myActions: actions.filter(a => a.owner === currentSpeaker),
-      unresolvedQuestions: [],
-      needsClarity: [],
-      followUps: []
-    };
-    
-    // Top 3 things discussed (by frequency + recency)
-    const topTopics = topics.slice(0, 3).map(t => t.word);
-    summary.topThree = topTopics;
-    
-    // Unresolved questions
-    const allText = segments.map(s => s.text).join(' ');
-    const questions = NLP.questions(allText);
-    summary.unresolvedQuestions = questions.slice(-5);
-    
-    // Items needing clarity (ambiguous terms used)
-    segments.forEach(s => {
-      const pm = NLP.pmPatterns(s.text, s.speaker);
-      pm.ambiguity.forEach(a => {
-        summary.needsClarity.push({ term: a.term, speaker: a.speaker });
-      });
-    });
-    
-    // Follow-ups needed
-    const speakersWithActions = [...new Set(actions.map(a => a.owner))].filter(o => o !== 'Unassigned');
-    speakersWithActions.forEach(sp => {
-      const spActions = actions.filter(a => a.owner === sp);
-      if (spActions.length > 0) {
-        summary.followUps.push({ speaker: sp, actionCount: spActions.length });
-      }
-    });
-    
-    return summary;
-  },
-
-  // ==================== SMART ALERTS ====================
-  generateAlerts: (segments, topics, currentSpeaker, elapsed) => {
-    const alerts = [];
-    
-    if (segments.length < 2) return alerts;
-    
-    // Topic discussed for 10+ minutes without resolution
-    const recentSegments = segments.slice(-20);
-    const recentTopics = {};
-    recentSegments.forEach(s => {
-      const segTopics = NLP.topics(s.text);
-      segTopics.forEach(t => {
-        recentTopics[t.word] = (recentTopics[t.word] || 0) + 1;
-      });
-    });
-    
-    Object.entries(recentTopics).forEach(([topic, count]) => {
-      if (count >= 5) {
-        alerts.push({
-          id: generateId(),
-          type: 'topic_drift',
-          priority: 'medium',
-          message: `"${topic}" has been discussed extensively`,
-          action: 'Consider parking or making a decision'
-        });
-      }
-    });
-    
-    // You haven't spoken in 5+ minutes
-    const lastUserSegment = [...segments].reverse().find(s => s.speaker === currentSpeaker);
-    if (lastUserSegment && elapsed - lastUserSegment.timestamp > 300000) {
-      alerts.push({
-        id: generateId(),
-        type: 'engagement',
-        priority: 'low',
-        message: "You haven't spoken in 5+ minutes",
-        action: 'Consider contributing to the discussion'
-      });
-    }
-    
-    // Scope creep detected
-    const lastFewSegments = segments.slice(-5);
-    lastFewSegments.forEach(s => {
-      const pm = NLP.pmPatterns(s.text, s.speaker);
-      if (pm.scopeCreep.length > 0) {
-        alerts.push({
-          id: generateId(),
-          type: 'scope_creep',
-          priority: 'high',
-          message: `Scope creep signal from ${s.speaker}`,
-          action: 'Consider noting for backlog vs. current scope'
-        });
-      }
-    });
-    
-    // Strong resistance detected
-    const lastSegment = segments[segments.length - 1];
-    if (lastSegment) {
-      const alignment = NLP.alignmentSignals(lastSegment.text, lastSegment.speaker);
-      if (alignment.resistance.length >= 2) {
-        alerts.push({
-          id: generateId(),
-          type: 'resistance',
-          priority: 'high',
-          message: `${lastSegment.speaker} showing resistance`,
-          action: 'Acknowledge concerns before proceeding'
-        });
-      }
-    }
-    
-    return alerts.slice(0, 3); // Max 3 alerts
-  },
-
-  // ==================== SUMMARY GENERATION ====================
   summary: (segs, topics, decisions, actions) => {
     const dur = segs.length > 0 ? Math.round((segs[segs.length - 1].timestamp) / 60000) : 0;
     const speakers = [...new Set(segs.map(s => s.speaker))];
-    let sum = `This ${dur} minute conversation involved ${speakers.length} participant${speakers.length !== 1 ? 's' : ''}`;
-    if (topics.length) sum += ` and covered ${topics.slice(0, 3).map(t => t.word).join(', ')}`;
-    sum += '.';
-    if (decisions.length) sum += ` ${decisions.length} decision${decisions.length !== 1 ? 's were' : ' was'} made.`;
-    if (actions.length) sum += ` ${actions.length} action item${actions.length !== 1 ? 's' : ''} identified.`;
-    return sum;
+    let sum = `${dur}min with ${speakers.length} speaker${speakers.length !== 1 ? 's' : ''}`;
+    if (topics.length) sum += ` on ${topics.slice(0, 3).map(t => t.word).join(', ')}`;
+    if (decisions.length) sum += `. ${decisions.length} decision${decisions.length !== 1 ? 's' : ''}`;
+    if (actions.length) sum += `, ${actions.length} action${actions.length !== 1 ? 's' : ''}`;
+    return sum + '.';
   },
 
   insights: (seg, profiles) => {
     const insights = [];
     if (!seg) return insights;
-    
     const sent = NLP.sentiment(seg.text);
-    if (sent.label === 'negative') {
-      insights.push({ type: 'warning', priority: 'high', message: 'Negative sentiment detected', action: 'Acknowledge their concerns first' });
-    }
-    
-    if (NLP.questions(seg.text).length > 0) {
-      insights.push({ type: 'opportunity', priority: 'high', message: 'Question detected', action: 'Provide a clear response' });
-    }
-    
-    const alignment = NLP.alignmentSignals(seg.text, seg.speaker);
-    if (alignment.agreement.length > 0) {
-      insights.push({ type: 'opportunity', priority: 'medium', message: 'Agreement signal', action: 'Good moment for next steps' });
-    }
-    if (alignment.resistance.length > 0) {
-      insights.push({ type: 'warning', priority: 'high', message: 'Resistance signal', action: 'Address concerns before moving forward' });
-    }
-    
-    const tactics = NLP.influenceTactics(seg.text, seg.speaker);
-    tactics.forEach(t => {
-      insights.push({ type: 'strategy', priority: 'medium', message: `${seg.speaker} using ${t.type.replace('_', ' ')}`, action: t.description });
-    });
-    
-    const profile = profiles[seg.speaker];
-    if (profile?.communicationStyle?.assertiveness > 60) {
-      insights.push({ type: 'strategy', priority: 'medium', message: `${seg.speaker} is assertive`, action: 'Be direct and confident' });
-    }
-    
-    return insights.slice(0, 4);
-  },
-
-  // ==================== STRATEGIC BRIEFING ====================
-  generateBriefing: (profile, name) => {
-    if (!profile || !profile.communicationStyle) return null;
-    
-    const style = profile.communicationStyle;
-    const briefing = [];
-    
-    briefing.push(`Based on ${profile.sessions?.length || 0} previous conversations:`);
-    
-    if (style.assertiveness > 60) {
-      briefing.push(`• ${name} is highly assertive - be direct and confident in your communication`);
-    } else if (style.assertiveness < 40) {
-      briefing.push(`• ${name} prefers a softer approach - use collaborative language`);
-    }
-    
-    if (style.dataDriven > 60) {
-      briefing.push(`• ${name} is data-driven - come prepared with metrics and evidence`);
-    } else if (style.dataDriven < 40) {
-      briefing.push(`• ${name} values intuition - narrative and vision resonate well`);
-    }
-    
-    if (style.riskTolerance > 60) {
-      briefing.push(`• ${name} is comfortable with risk - bold proposals may succeed`);
-    } else if (style.riskTolerance < 40) {
-      briefing.push(`• ${name} is risk-averse - address concerns proactively`);
-    }
-    
-    if (style.decisionStyle === 'quick') {
-      briefing.push(`• ${name} prefers quick decisions - avoid over-analysis`);
-    } else if (style.decisionStyle === 'deliberative') {
-      briefing.push(`• ${name} is deliberative - give time to process information`);
-    }
-    
-    // Top topics from history
-    if (profile.interactionHistory?.topicsDiscussed) {
-      const topHistoricalTopics = Object.entries(profile.interactionHistory.topicsDiscussed)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 3)
-        .map(([word]) => word);
-      if (topHistoricalTopics.length > 0) {
-        briefing.push(`• Frequently discussed topics: ${topHistoricalTopics.join(', ')}`);
-      }
-    }
-    
-    return briefing;
+    if (sent.label === 'negative') insights.push({ type: 'warning', message: 'Negative sentiment', action: 'Acknowledge concerns' });
+    if (NLP.questions(seg.text).length > 0) insights.push({ type: 'opportunity', message: 'Question detected', action: 'Provide clear response' });
+    if (['agree', 'yes', 'exactly', 'right'].some(w => seg.text.toLowerCase().includes(w))) insights.push({ type: 'opportunity', message: 'Agreement signal', action: 'Good moment for next steps' });
+    return insights.slice(0, 3);
   }
 };
 
-// ============================================================================
-// STORAGE
-// ============================================================================
+// Storage
 const Storage = {
   get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; }},
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
@@ -743,12 +267,12 @@ const Storage = {
   saveProfiles: (p) => Storage.set('ci_profiles', p),
   micGranted: () => Storage.get('ci_mic_granted') || false,
   setMicGranted: (v) => Storage.set('ci_mic_granted', v),
-  settings: () => Storage.get('ci_settings') || { showAlerts: true, showExecutiveSummary: true, myName: 'Speaker 1' },
+  settings: () => Storage.get('ci_settings') || { autoSpeaker: true, myName: 'Speaker 1' },
   saveSettings: (s) => Storage.set('ci_settings', s)
 };
 
 // ============================================================================
-// MICROPHONE HOOK
+// MICROPHONE HOOK WITH AUTO SPEAKER DETECTION
 // ============================================================================
 const useMicrophone = () => {
   const [permission, setPermission] = useState('unknown');
@@ -756,7 +280,8 @@ const useMicrophone = () => {
   const [level, setLevel] = useState(0);
   const [interim, setInterim] = useState('');
   const [error, setError] = useState(null);
-  const [micTestPassed, setMicTestPassed] = useState(false);
+  const [currentSpeaker, setCurrentSpeaker] = useState(null);
+  const [speakerChanged, setSpeakerChanged] = useState(false);
   
   const streamRef = useRef(null);
   const ctxRef = useRef(null);
@@ -764,125 +289,124 @@ const useMicrophone = () => {
   const recRef = useRef(null);
   const activeRef = useRef(false);
   const frameRef = useRef(null);
+  const featureBufferRef = useRef([]);
+  const lastSpeakerRef = useRef(null);
 
   useEffect(() => {
-    if (!hasGetUserMedia()) {
-      setPermission('unavailable');
-      setError('Microphone API not available');
-      return;
-    }
-    if (!isSecureContext()) {
-      setPermission('unavailable');
-      setError('Microphone requires HTTPS');
-      return;
-    }
-    if (Storage.micGranted()) {
-      setPermission('granted');
-    } else {
-      setPermission('prompt');
-    }
+    if (!hasGetUserMedia()) { setPermission('unavailable'); setError('Microphone not available'); return; }
+    if (!isSecureContext()) { setPermission('unavailable'); setError('Requires HTTPS'); return; }
+    if (Storage.micGranted()) setPermission('granted');
+    else setPermission('prompt');
     return () => stopMic();
   }, []);
 
   const requestPermission = async () => {
     setError(null);
-    if (!hasGetUserMedia() || !isSecureContext()) {
-      setError('Microphone not available');
-      setPermission('unavailable');
-      return false;
-    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const tracks = stream.getAudioTracks();
-      if (tracks.length === 0) throw new Error('No audio tracks');
-      const testCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const testAnalyser = testCtx.createAnalyser();
-      testAnalyser.fftSize = 256;
-      const testSource = testCtx.createMediaStreamSource(stream);
-      testSource.connect(testAnalyser);
-      testCtx.close();
       stream.getTracks().forEach(t => t.stop());
       setPermission('granted');
-      setMicTestPassed(true);
       Storage.setMicGranted(true);
       return true;
     } catch (e) {
-      let errorMessage = 'Microphone access failed';
-      if (e.name === 'NotAllowedError') {
-        errorMessage = 'Permission denied. Check browser settings.';
-        setPermission('denied');
-      } else if (e.name === 'NotFoundError') {
-        errorMessage = 'No microphone found';
-        setPermission('unavailable');
-      }
-      setError(errorMessage);
-      Storage.setMicGranted(false);
+      setError(e.name === 'NotAllowedError' ? 'Permission denied' : 'Microphone error');
+      if (e.name === 'NotAllowedError') setPermission('denied');
       return false;
     }
   };
 
-  const startMic = async (onTranscript) => {
+  const startMic = async (onTranscript, autoSpeakerEnabled = true) => {
     setError(null);
+    SpeakerDiarization.reset();
+    featureBufferRef.current = [];
+    lastSpeakerRef.current = null;
+    
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
       if (ctxRef.current.state === 'suspended') await ctxRef.current.resume();
+      
       analyserRef.current = ctxRef.current.createAnalyser();
-      analyserRef.current.fftSize = 256;
-      analyserRef.current.smoothingTimeConstant = 0.8;
-      const source = ctxRef.current.createMediaStreamSource(stream);
-      source.connect(analyserRef.current);
+      analyserRef.current.fftSize = 2048;
+      analyserRef.current.smoothingTimeConstant = 0.3;
+      
+      ctxRef.current.createMediaStreamSource(stream).connect(analyserRef.current);
       activeRef.current = true;
       setListening(true);
       setPermission('granted');
       Storage.setMicGranted(true);
       
+      // Audio monitoring & feature extraction
+      let sampleCount = 0;
       const updateLevel = () => {
         if (!activeRef.current || !analyserRef.current) return;
         const data = new Uint8Array(analyserRef.current.frequencyBinCount);
         analyserRef.current.getByteFrequencyData(data);
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
         setLevel(Math.min(100, avg * 2));
+        
+        // Sample features when there's audio
+        if (autoSpeakerEnabled && avg > 10) {
+          sampleCount++;
+          if (sampleCount % 5 === 0) {
+            const features = SpeakerDiarization.extractFeatures(analyserRef.current);
+            if (features.energy > 5) {
+              featureBufferRef.current.push(features);
+              if (featureBufferRef.current.length > 20) featureBufferRef.current.shift();
+            }
+          }
+        }
         frameRef.current = requestAnimationFrame(updateLevel);
       };
       updateLevel();
       
+      // Speech recognition
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (SR) {
         const rec = new SR();
         rec.continuous = true;
         rec.interimResults = true;
         rec.lang = 'en-US';
-        rec.maxAlternatives = 1;
+        
         rec.onresult = (e) => {
           let final = '', inter = '';
           for (let i = e.resultIndex; i < e.results.length; i++) {
             const transcript = e.results[i][0].transcript;
-            if (e.results[i].isFinal) final += transcript;
-            else inter += transcript;
+            if (e.results[i].isFinal) {
+              final += transcript;
+              // Identify speaker from collected features
+              if (autoSpeakerEnabled && featureBufferRef.current.length > 0) {
+                const avgFeatures = {};
+                const keys = Object.keys(featureBufferRef.current[0]).filter(k => typeof featureBufferRef.current[0][k] === 'number');
+                keys.forEach(key => {
+                  avgFeatures[key] = featureBufferRef.current.reduce((sum, f) => sum + (f[key] || 0), 0) / featureBufferRef.current.length;
+                });
+                const speaker = SpeakerDiarization.identifySpeaker(avgFeatures);
+                if (speaker) {
+                  if (speaker !== lastSpeakerRef.current) {
+                    setSpeakerChanged(true);
+                    setTimeout(() => setSpeakerChanged(false), 500);
+                  }
+                  setCurrentSpeaker(speaker);
+                  lastSpeakerRef.current = speaker;
+                }
+                featureBufferRef.current = [];
+              }
+            } else inter += transcript;
           }
           setInterim(final || inter);
-          if (final && onTranscript) onTranscript(final);
+          if (final && onTranscript) onTranscript(final, autoSpeakerEnabled ? lastSpeakerRef.current : null);
         };
-        rec.onerror = (e) => {
-          if (e.error !== 'no-speech' && e.error !== 'aborted') console.log('[Mic] Speech error:', e.error);
-        };
-        rec.onend = () => {
-          if (activeRef.current) setTimeout(() => { if (activeRef.current) try { rec.start(); } catch {} }, 100);
-        };
+        
+        rec.onerror = (e) => { if (e.error !== 'no-speech' && e.error !== 'aborted') console.log('Speech error:', e.error); };
+        rec.onend = () => { if (activeRef.current) setTimeout(() => { if (activeRef.current) try { rec.start(); } catch {} }, 100); };
         recRef.current = rec;
         rec.start();
-      } else {
-        setError('Speech recognition not supported');
-      }
+      } else setError('Speech recognition not supported');
       return true;
     } catch (e) {
-      setError(`Failed to start: ${e.message}`);
-      if (e.name === 'NotAllowedError') {
-        setPermission('denied');
-        Storage.setMicGranted(false);
-      }
+      setError(`Failed: ${e.message}`);
       return false;
     }
   };
@@ -892,663 +416,112 @@ const useMicrophone = () => {
     setListening(false);
     setLevel(0);
     setInterim('');
+    setCurrentSpeaker(null);
     if (frameRef.current) cancelAnimationFrame(frameRef.current);
     if (recRef.current) try { recRef.current.stop(); } catch {}
     if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
     if (ctxRef.current) try { ctxRef.current.close(); } catch {}
-    streamRef.current = null;
-    ctxRef.current = null;
-    analyserRef.current = null;
-    recRef.current = null;
-    frameRef.current = null;
   };
 
-  return { permission, listening, level, interim, error, micTestPassed, requestPermission, startMic, stopMic };
+  return { permission, listening, level, interim, error, currentSpeaker, speakerChanged, requestPermission, startMic, stopMic, getSpeakers: SpeakerDiarization.getSpeakers, getSpeakerCount: SpeakerDiarization.getSpeakerCount };
 };
-
-// ============================================================================
-// UI COMPONENTS
-// ============================================================================
-
-// Card Component
-const Card = ({ children, style, className = '' }) => (
-  <div className={className} style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '20px', border: '1px solid rgba(99,102,241,0.2)', ...style }}>
-    {children}
-  </div>
-);
-
-// Badge Component
-const Badge = ({ children, color = '#6366f1', style }) => (
-  <span style={{ display: 'inline-flex', alignItems: 'center', padding: '4px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: '600', backgroundColor: `${color}20`, color, ...style }}>
-    {children}
-  </span>
-);
-
-// Progress Bar Component
-const ProgressBar = ({ value, color = '#6366f1', label, height = 6 }) => (
-  <div>
-    {label && <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-      <span style={{ fontSize: '12px', color: '#94a3b8' }}>{label}</span>
-      <span style={{ fontSize: '12px', fontWeight: '600' }}>{value}%</span>
-    </div>}
-    <div style={{ height: `${height}px`, backgroundColor: '#1e1e2e', borderRadius: `${height/2}px`, overflow: 'hidden' }}>
-      <div style={{ width: `${value}%`, height: '100%', backgroundColor: color, borderRadius: `${height/2}px`, transition: 'width 0.3s ease' }} />
-    </div>
-  </div>
-);
-
-// Alert Component
-const AlertBanner = ({ alert, onDismiss }) => {
-  const colors = {
-    topic_drift: { bg: '#7c3aed', icon: '🔄' },
-    engagement: { bg: '#f59e0b', icon: '👋' },
-    scope_creep: { bg: '#ef4444', icon: '⚠️' },
-    resistance: { bg: '#ef4444', icon: '🛑' }
-  };
-  const config = colors[alert.type] || { bg: '#6366f1', icon: '💡' };
-  
-  return (
-    <div className="slide-in" style={{ 
-      backgroundColor: `${config.bg}15`, 
-      border: `1px solid ${config.bg}40`, 
-      borderRadius: '12px', 
-      padding: '12px 16px',
-      marginBottom: '8px',
-      display: 'flex',
-      alignItems: 'flex-start',
-      gap: '12px'
-    }}>
-      <span style={{ fontSize: '20px' }}>{config.icon}</span>
-      <div style={{ flex: 1 }}>
-        <div style={{ fontWeight: '600', fontSize: '14px', color: '#e2e8f0' }}>{alert.message}</div>
-        <div style={{ fontSize: '13px', color: config.bg, marginTop: '2px' }}>→ {alert.action}</div>
-      </div>
-      <button onClick={() => onDismiss(alert.id)} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', padding: '4px' }}>✕</button>
-    </div>
-  );
-};
-
-// Executive Summary Panel
-const ExecutiveSummaryPanel = ({ summary, visible }) => {
-  if (!visible) return null;
-  
-  return (
-    <Card style={{ marginBottom: '16px', borderColor: 'rgba(16,185,129,0.4)', background: 'linear-gradient(135deg, #111118, #0f1f1a)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' }}>
-        <span style={{ fontSize: '20px' }}>📋</span>
-        <h3 style={{ margin: 0, fontSize: '16px', fontWeight: '700', color: '#10b981' }}>Executive Summary</h3>
-      </div>
-      
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '16px' }}>
-        <div style={{ padding: '12px', backgroundColor: 'rgba(99,102,241,0.1)', borderRadius: '10px' }}>
-          <div style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '4px' }}>Top Topics</div>
-          <div style={{ fontSize: '14px', fontWeight: '600' }}>
-            {summary.topThree.length > 0 ? summary.topThree.join(', ') : 'No topics yet'}
-          </div>
-        </div>
-        <div style={{ padding: '12px', backgroundColor: 'rgba(16,185,129,0.1)', borderRadius: '10px' }}>
-          <div style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '4px' }}>Decisions Made</div>
-          <div style={{ fontSize: '24px', fontWeight: '700', color: '#10b981' }}>{summary.decisionCount}</div>
-        </div>
-      </div>
-      
-      {summary.myActions.length > 0 && (
-        <div style={{ marginBottom: '12px' }}>
-          <div style={{ fontSize: '12px', color: '#f59e0b', fontWeight: '600', marginBottom: '6px' }}>📌 YOUR ACTION ITEMS</div>
-          {summary.myActions.map((a, i) => (
-            <div key={i} style={{ padding: '8px 12px', backgroundColor: 'rgba(245,158,11,0.1)', borderRadius: '8px', fontSize: '13px', marginBottom: '4px', borderLeft: '3px solid #f59e0b' }}>
-              {a.action}
-            </div>
-          ))}
-        </div>
-      )}
-      
-      {summary.unresolvedQuestions.length > 0 && (
-        <div>
-          <div style={{ fontSize: '12px', color: '#ec4899', fontWeight: '600', marginBottom: '6px' }}>❓ UNRESOLVED ({summary.unresolvedQuestions.length})</div>
-          <div style={{ fontSize: '13px', color: '#f9a8d4' }}>
-            {summary.unresolvedQuestions.slice(0, 2).map((q, i) => (
-              <div key={i} style={{ marginBottom: '4px' }}>• {q.text.substring(0, 60)}...</div>
-            ))}
-          </div>
-        </div>
-      )}
-    </Card>
-  );
-};
-
-// Influence Tactics Panel
-const InfluenceTacticsPanel = ({ tactics }) => {
-  const tacticEmoji = {
-    rational_persuasion: '📊',
-    consultation: '🤝',
-    inspirational_appeal: '✨',
-    coalition_building: '👥',
-    legitimating: '📜',
-    personal_appeal: '💝'
-  };
-  
-  const grouped = tactics.reduce((acc, t) => {
-    if (!acc[t.type]) acc[t.type] = [];
-    acc[t.type].push(t);
-    return acc;
-  }, {});
-  
-  if (Object.keys(grouped).length === 0) return null;
-  
-  return (
-    <Card style={{ marginBottom: '16px' }}>
-      <h3 style={{ margin: '0 0 16px', fontSize: '14px', fontWeight: '600', color: '#94a3b8', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <span>🎯</span> Influence Tactics Detected
-      </h3>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-        {Object.entries(grouped).map(([type, items]) => (
-          <Badge key={type} color={items[0].confidence === 'high' ? '#10b981' : '#f59e0b'}>
-            {tacticEmoji[type] || '📌'} {type.replace('_', ' ')} ({items.length})
-          </Badge>
-        ))}
-      </div>
-    </Card>
-  );
-};
-
-// Meeting Quality Dashboard
-const MeetingQualityDashboard = ({ metrics }) => {
-  if (!metrics.productivity) return null;
-  
-  const getHealthColor = (value) => value >= 70 ? '#10b981' : value >= 40 ? '#f59e0b' : '#ef4444';
-  
-  return (
-    <Card style={{ marginBottom: '16px' }}>
-      <h3 style={{ margin: '0 0 16px', fontSize: '14px', fontWeight: '600', color: '#94a3b8', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <span>📈</span> Meeting Quality
-      </h3>
-      
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '16px', marginBottom: '16px' }}>
-        <div>
-          <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '4px' }}>Action Clarity</div>
-          <ProgressBar value={metrics.productivity.actionClarity || 0} color={getHealthColor(metrics.productivity.actionClarity)} />
-        </div>
-        <div>
-          <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '4px' }}>Participation Balance</div>
-          <ProgressBar value={metrics.productivity.participationBalance || 0} color={getHealthColor(metrics.productivity.participationBalance)} />
-        </div>
-      </div>
-      
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
-        <div style={{ padding: '10px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '8px', textAlign: 'center' }}>
-          <div style={{ fontSize: '18px', fontWeight: '700', color: getHealthColor(metrics.health.forwardLooking || 50) }}>
-            {metrics.health.forwardLooking || 50}%
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b' }}>Forward Looking</div>
-        </div>
-        <div style={{ padding: '10px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '8px', textAlign: 'center' }}>
-          <div style={{ fontSize: '18px', fontWeight: '700', color: getHealthColor(metrics.health.solutionFocus || 50) }}>
-            {metrics.health.solutionFocus || 50}%
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b' }}>Solution Focus</div>
-        </div>
-        <div style={{ padding: '10px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '8px', textAlign: 'center' }}>
-          <div style={{ fontSize: '18px', fontWeight: '700' }}>
-            {metrics.health.questionRatio || 0}%
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b' }}>Questions</div>
-        </div>
-      </div>
-    </Card>
-  );
-};
-
-// PM Alerts Panel
-const PMAlertPanel = ({ pmPatterns }) => {
-  const hasAlerts = pmPatterns.scopeCreep.length > 0 || pmPatterns.ambiguity.length > 0;
-  if (!hasAlerts) return null;
-  
-  return (
-    <Card style={{ marginBottom: '16px', borderColor: 'rgba(239,68,68,0.4)' }}>
-      <h3 style={{ margin: '0 0 12px', fontSize: '14px', fontWeight: '600', color: '#ef4444', display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <span>⚡</span> PM Alerts
-      </h3>
-      
-      {pmPatterns.scopeCreep.length > 0 && (
-        <div style={{ marginBottom: '12px' }}>
-          <div style={{ fontSize: '12px', fontWeight: '600', color: '#f87171', marginBottom: '6px' }}>🚨 Scope Creep Signals</div>
-          {pmPatterns.scopeCreep.slice(0, 3).map((s, i) => (
-            <div key={i} style={{ fontSize: '13px', color: '#fca5a5', padding: '6px 10px', backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: '6px', marginBottom: '4px' }}>
-              <strong>{s.speaker}:</strong> "{s.signal}..."
-            </div>
-          ))}
-        </div>
-      )}
-      
-      {pmPatterns.ambiguity.length > 0 && (
-        <div>
-          <div style={{ fontSize: '12px', fontWeight: '600', color: '#fbbf24', marginBottom: '6px' }}>⚠️ Ambiguous Terms</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-            {[...new Set(pmPatterns.ambiguity.map(a => a.term))].slice(0, 5).map((term, i) => (
-              <Badge key={i} color="#f59e0b">{term}</Badge>
-            ))}
-          </div>
-        </div>
-      )}
-    </Card>
-  );
-};
-
-// End of Meeting Summary Modal
-const EndMeetingSummary = ({ summary, onClose }) => (
-  <div style={{ 
-    position: 'fixed', 
-    inset: 0, 
-    backgroundColor: 'rgba(0,0,0,0.8)', 
-    display: 'flex', 
-    alignItems: 'center', 
-    justifyContent: 'center', 
-    padding: '20px',
-    zIndex: 1000 
-  }}>
-    <Card style={{ maxWidth: '480px', width: '100%', maxHeight: '80vh', overflow: 'auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-        <h2 style={{ margin: 0, fontSize: '20px' }}>📋 Meeting Wrap-up</h2>
-        <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#64748b', fontSize: '24px', cursor: 'pointer' }}>×</button>
-      </div>
-      
-      {summary.needsClarity.length > 0 && (
-        <div style={{ marginBottom: '20px', padding: '16px', backgroundColor: 'rgba(245,158,11,0.1)', borderRadius: '12px', border: '1px solid rgba(245,158,11,0.3)' }}>
-          <div style={{ fontWeight: '600', color: '#f59e0b', marginBottom: '8px' }}>⚠️ These items need clarity:</div>
-          {[...new Set(summary.needsClarity.map(n => n.term))].slice(0, 5).map((term, i) => (
-            <div key={i} style={{ fontSize: '14px', color: '#fcd34d', marginBottom: '4px' }}>• "{term}" was mentioned without specifics</div>
-          ))}
-        </div>
-      )}
-      
-      {summary.myActions.length > 0 && (
-        <div style={{ marginBottom: '20px', padding: '16px', backgroundColor: 'rgba(99,102,241,0.1)', borderRadius: '12px', border: '1px solid rgba(99,102,241,0.3)' }}>
-          <div style={{ fontWeight: '600', color: '#6366f1', marginBottom: '8px' }}>✅ You committed to:</div>
-          {summary.myActions.map((a, i) => (
-            <div key={i} style={{ fontSize: '14px', color: '#a5b4fc', marginBottom: '4px' }}>• {a.action}</div>
-          ))}
-        </div>
-      )}
-      
-      {summary.followUps.length > 0 && (
-        <div style={{ marginBottom: '20px', padding: '16px', backgroundColor: 'rgba(16,185,129,0.1)', borderRadius: '12px', border: '1px solid rgba(16,185,129,0.3)' }}>
-          <div style={{ fontWeight: '600', color: '#10b981', marginBottom: '8px' }}>📞 Follow up needed with:</div>
-          {summary.followUps.map((f, i) => (
-            <div key={i} style={{ fontSize: '14px', color: '#6ee7b7', marginBottom: '4px' }}>• {f.speaker} ({f.actionCount} action items)</div>
-          ))}
-        </div>
-      )}
-      
-      <button onClick={onClose} style={{ width: '100%', padding: '14px', backgroundColor: '#6366f1', border: 'none', borderRadius: '10px', color: 'white', fontWeight: '600', fontSize: '16px', cursor: 'pointer' }}>
-        Got it!
-      </button>
-    </Card>
-  </div>
-);
 
 // ============================================================================
 // MAIN APP
 // ============================================================================
 function App() {
-  // Core state
   const [tab, setTab] = useState('record');
   const [recording, setRecording] = useState(false);
   const [paused, setPaused] = useState(false);
   const [startTime, setStartTime] = useState(null);
   const [elapsed, setElapsed] = useState(0);
   const [segments, setSegments] = useState([]);
-  const [speaker, setSpeaker] = useState('Speaker 1');
-  const [speakers, setSpeakers] = useState(['Speaker 1', 'Speaker 2']);
+  const [manualSpeaker, setManualSpeaker] = useState('Speaker 1');
   const [manual, setManual] = useState('');
   const [mode, setMode] = useState(() => Storage.micGranted() ? 'voice' : 'manual');
-  
-  // Analysis state
-  const [analysis, setAnalysis] = useState({
-    sentiment: { score: 0, label: 'neutral' },
-    topics: [],
-    questions: [],
-    actions: [],
-    decisions: [],
-    stats: {},
-    influenceTactics: [],
-    alignmentSignals: { agreement: [], resistance: [], commitment: null, gaps: [] },
-    powerDynamics: { speakingTime: {}, responsePatterns: {}, deferenceMarkers: [] },
-    meetingEffectiveness: { productivity: {}, health: {}, alerts: [] },
-    pmPatterns: { prioritization: [], requirements: [], scopeCreep: [], ambiguity: [] },
-    negotiation: { positions: [], concessions: [], anchors: [], batna: [], framing: null, commitments: [], reciprocity: [] },
-    executiveSummary: { topThree: [], decisionCount: 0, decisionList: [], myActions: [], unresolvedQuestions: [], needsClarity: [], followUps: [] }
-  });
-  
+  const [analysis, setAnalysis] = useState({ sentiment: { score: 0, label: 'neutral' }, topics: [], questions: [], actions: [], decisions: [], stats: {} });
   const [insights, setInsights] = useState([]);
-  const [alerts, setAlerts] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [profiles, setProfiles] = useState({});
   const [selected, setSelected] = useState(null);
   const [settings, setSettings] = useState(Storage.settings);
-  const [showEndSummary, setShowEndSummary] = useState(false);
-  const [dismissedAlerts, setDismissedAlerts] = useState(new Set());
 
   const mic = useMicrophone();
   const scrollRef = useRef(null);
   const timerRef = useRef(null);
 
-  // Load saved data
-  useEffect(() => {
-    setSessions(Storage.sessions());
-    setProfiles(Storage.profiles());
-    setSettings(Storage.settings());
-  }, []);
+  useEffect(() => { setSessions(Storage.sessions()); setProfiles(Storage.profiles()); setSettings(Storage.settings()); }, []);
+  useEffect(() => { if (mic.permission === 'granted') setMode('voice'); }, [mic.permission]);
+  useEffect(() => { if (recording && !paused) timerRef.current = setInterval(() => setElapsed(Date.now() - startTime), 1000); else clearInterval(timerRef.current); return () => clearInterval(timerRef.current); }, [recording, paused, startTime]);
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [segments]);
 
-  useEffect(() => {
-    if (mic.permission === 'granted' && mic.micTestPassed) setMode('voice');
-  }, [mic.permission, mic.micTestPassed]);
-  
-  // Timer
-  useEffect(() => {
-    if (recording && !paused) {
-      timerRef.current = setInterval(() => setElapsed(Date.now() - startTime), 1000);
-    } else clearInterval(timerRef.current);
-    return () => clearInterval(timerRef.current);
-  }, [recording, paused, startTime]);
-
-  // Scroll to bottom
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [segments]);
-
-  // Main analysis effect
   useEffect(() => {
     if (segments.length === 0) return;
-    
     const text = segments.map(s => s.text).join(' ');
     const last = segments[segments.length - 1];
-    
-    // Basic stats per speaker
+    const speakers = [...new Set(segments.map(s => s.speaker))];
     const stats = {};
     speakers.forEach(sp => {
       const segs = segments.filter(s => s.speaker === sp);
       const txt = segs.map(s => s.text).join(' ');
-      stats[sp] = {
-        count: segs.length,
-        words: txt.split(/\s+/).length,
-        sentiment: NLP.sentiment(txt)
-      };
+      const totalWords = segments.reduce((sum, s) => sum + s.text.split(/\s+/).length, 0);
+      const spWords = txt.split(/\s+/).length;
+      stats[sp] = { count: segs.length, words: spWords, pct: Math.round((spWords / totalWords) * 100), sentiment: NLP.sentiment(txt) };
     });
-    
-    // Collect all influence tactics
-    const allTactics = segments.flatMap(s => NLP.influenceTactics(s.text, s.speaker));
-    
-    // Collect all alignment signals
-    const allAlignment = {
-      agreement: [],
-      resistance: [],
-      commitment: null,
-      gaps: []
-    };
-    segments.forEach(s => {
-      const sig = NLP.alignmentSignals(s.text, s.speaker);
-      allAlignment.agreement.push(...sig.agreement);
-      allAlignment.resistance.push(...sig.resistance);
-      if (sig.commitment) allAlignment.commitment = sig.commitment;
-      allAlignment.gaps.push(...sig.gaps);
-    });
-    
-    // Collect all PM patterns
-    const allPM = {
-      prioritization: [],
-      requirements: [],
-      scopeCreep: [],
-      ambiguity: []
-    };
-    segments.forEach(s => {
-      const pm = NLP.pmPatterns(s.text, s.speaker);
-      allPM.prioritization.push(...pm.prioritization);
-      allPM.requirements.push(...pm.requirements);
-      allPM.scopeCreep.push(...pm.scopeCreep);
-      allPM.ambiguity.push(...pm.ambiguity);
-    });
-    
-    // Collect negotiation dynamics
-    const allNegotiation = {
-      positions: [],
-      concessions: [],
-      anchors: [],
-      batna: [],
-      framing: null,
-      commitments: [],
-      reciprocity: []
-    };
-    segments.forEach(s => {
-      const neg = NLP.negotiationDynamics(s.text, s.speaker, segments);
-      allNegotiation.anchors.push(...neg.anchors);
-      allNegotiation.batna.push(...neg.batna);
-      allNegotiation.concessions.push(...neg.concessions);
-      allNegotiation.commitments.push(...neg.commitments);
-      allNegotiation.reciprocity.push(...neg.reciprocity);
-      if (neg.framing) allNegotiation.framing = neg.framing;
-    });
-    
-    const topics = NLP.topics(text);
-    const decisions = NLP.decisions(text);
-    const actions = segments.flatMap(s => NLP.actions(s.text, s.speaker));
-    
     setAnalysis({
       sentiment: NLP.sentiment(text),
-      topics,
+      topics: NLP.topics(text),
       questions: NLP.questions(text),
-      actions,
-      decisions,
-      stats,
-      influenceTactics: allTactics,
-      alignmentSignals: allAlignment,
-      powerDynamics: NLP.powerDynamics(segments),
-      meetingEffectiveness: NLP.meetingEffectiveness(segments, topics, decisions, actions),
-      pmPatterns: allPM,
-      negotiation: allNegotiation,
-      executiveSummary: NLP.executiveSummary(segments, topics, decisions, actions, settings.myName)
+      actions: segments.flatMap(s => NLP.actions(s.text, s.speaker)),
+      decisions: NLP.decisions(text),
+      stats
     });
-    
     setInsights(NLP.insights(last, profiles));
-    
-    // Generate alerts
-    if (settings.showAlerts) {
-      const newAlerts = NLP.generateAlerts(segments, topics, settings.myName, elapsed);
-      setAlerts(newAlerts.filter(a => !dismissedAlerts.has(a.id)));
-    }
-  }, [segments, speakers, profiles, elapsed, settings.myName, settings.showAlerts, dismissedAlerts]);
+  }, [segments, profiles]);
 
-  const addSeg = (text) => {
+  const addSeg = useCallback((text, autoSpeaker = null) => {
     if (!text.trim()) return;
-    setSegments(p => [...p, {
-      id: generateId(),
-      speaker,
-      text: text.trim(),
-      timestamp: Date.now() - startTime,
-      sentiment: NLP.sentiment(text)
-    }]);
-  };
+    const speaker = mode === 'voice' && settings.autoSpeaker && autoSpeaker ? autoSpeaker : manualSpeaker;
+    setSegments(p => [...p, { id: generateId(), speaker, text: text.trim(), timestamp: Date.now() - startTime, sentiment: NLP.sentiment(text) }]);
+  }, [mode, settings.autoSpeaker, manualSpeaker, startTime]);
 
   const startRec = async () => {
-    setRecording(true);
-    setPaused(false);
-    setStartTime(Date.now());
-    setElapsed(0);
-    setSegments([]);
-    setAlerts([]);
-    setDismissedAlerts(new Set());
-    setAnalysis({
-      sentiment: { score: 0, label: 'neutral' },
-      topics: [],
-      questions: [],
-      actions: [],
-      decisions: [],
-      stats: {},
-      influenceTactics: [],
-      alignmentSignals: { agreement: [], resistance: [], commitment: null, gaps: [] },
-      powerDynamics: { speakingTime: {}, responsePatterns: {}, deferenceMarkers: [] },
-      meetingEffectiveness: { productivity: {}, health: {}, alerts: [] },
-      pmPatterns: { prioritization: [], requirements: [], scopeCreep: [], ambiguity: [] },
-      negotiation: { positions: [], concessions: [], anchors: [], batna: [], framing: null, commitments: [], reciprocity: [] },
-      executiveSummary: { topThree: [], decisionCount: 0, decisionList: [], myActions: [], unresolvedQuestions: [], needsClarity: [], followUps: [] }
-    });
-    if (mode === 'voice') {
-      const ok = await mic.startMic(t => { if (t.trim()) addSeg(t.trim()); });
-      if (!ok) setMode('manual');
-    }
+    setRecording(true); setPaused(false); setStartTime(Date.now()); setElapsed(0); setSegments([]);
+    setAnalysis({ sentiment: { score: 0, label: 'neutral' }, topics: [], questions: [], actions: [], decisions: [], stats: {} });
+    if (mode === 'voice') { const ok = await mic.startMic((text, speaker) => addSeg(text, speaker), settings.autoSpeaker); if (!ok) setMode('manual'); }
   };
 
   const stopRec = () => {
-    setRecording(false);
-    setPaused(false);
-    mic.stopMic();
-    
+    setRecording(false); setPaused(false); mic.stopMic();
     if (segments.length > 0) {
-      // Show end summary
-      setShowEndSummary(true);
-      
-      const sess = {
-        id: generateId(),
-        startTime,
-        endTime: Date.now(),
-        duration: elapsed,
-        segments,
-        analysis: {
-          summary: NLP.summary(segments, analysis.topics, analysis.decisions, analysis.actions),
-          ...analysis
-        },
-        speakers: [...new Set(segments.map(s => s.speaker))]
-      };
-      const updated = [sess, ...sessions];
-      setSessions(updated);
-      Storage.saveSessions(updated);
-      updateProfiles(segments);
+      const sess = { id: generateId(), startTime, endTime: Date.now(), duration: elapsed, segments, analysis: { summary: NLP.summary(segments, analysis.topics, analysis.decisions, analysis.actions), ...analysis }, speakers: [...new Set(segments.map(s => s.speaker))] };
+      const updated = [sess, ...sessions]; setSessions(updated); Storage.saveSessions(updated); updateProfiles(segments);
     }
   };
 
-  const togglePause = async () => {
-    if (paused) {
-      setPaused(false);
-      if (mode === 'voice') await mic.startMic(t => { if (t.trim()) addSeg(t.trim()); });
-    } else {
-      setPaused(true);
-      mic.stopMic();
-    }
-  };
+  const togglePause = async () => { if (paused) { setPaused(false); if (mode === 'voice') await mic.startMic((text, speaker) => addSeg(text, speaker), settings.autoSpeaker); } else { setPaused(true); mic.stopMic(); } };
 
   const updateProfiles = (segs) => {
     const p = { ...profiles };
     [...new Set(segs.map(s => s.speaker))].forEach(sp => {
       const spSegs = segs.filter(s => s.speaker === sp);
-      if (!p[sp]) p[sp] = {
-        id: generateId(),
-        name: sp,
-        sessions: [],
-        communicationStyle: {},
-        interactionHistory: { topicsDiscussed: {}, agreementRate: 0, resistanceTopics: [] },
-        strategicNotes: ''
-      };
-      
+      if (!p[sp]) p[sp] = { id: generateId(), name: sp, sessions: [], communicationStyle: {}, topicsDiscussed: {} };
       const style = NLP.style(spSegs);
-      if (!Object.keys(p[sp].communicationStyle).length) {
-        p[sp].communicationStyle = style;
-      } else {
-        Object.keys(style).forEach(k => {
-          if (typeof style[k] === 'number') {
-            p[sp].communicationStyle[k] = Math.round((p[sp].communicationStyle[k] + style[k]) / 2);
-          } else {
-            p[sp].communicationStyle[k] = style[k];
-          }
-        });
-      }
-      
-      NLP.topics(spSegs.map(s => s.text).join(' ')).forEach(t => {
-        p[sp].interactionHistory.topicsDiscussed[t.word] = (p[sp].interactionHistory.topicsDiscussed[t.word] || 0) + t.count;
-      });
-      
-      // Generate strategic notes based on enhanced profile
-      const briefing = NLP.generateBriefing(p[sp], sp);
-      if (briefing) {
-        p[sp].strategicNotes = briefing.slice(1).join('\n');
-      }
-      
+      if (!Object.keys(p[sp].communicationStyle).length) p[sp].communicationStyle = style;
+      else Object.keys(style).forEach(k => { if (typeof style[k] === 'number') p[sp].communicationStyle[k] = Math.round((p[sp].communicationStyle[k] + style[k]) / 2); else p[sp].communicationStyle[k] = style[k]; });
+      NLP.topics(spSegs.map(s => s.text).join(' ')).forEach(t => { p[sp].topicsDiscussed[t.word] = (p[sp].topicsDiscussed[t.word] || 0) + t.count; });
       p[sp].sessions.push(Date.now());
     });
-    setProfiles(p);
-    Storage.saveProfiles(p);
-  };
-
-  const dismissAlert = (id) => {
-    setDismissedAlerts(prev => new Set([...prev, id]));
-    setAlerts(prev => prev.filter(a => a.id !== id));
+    setProfiles(p); Storage.saveProfiles(p);
   };
 
   const exportMD = (s) => {
-    let md = `# Conversation Intelligence Report
-## ${formatDate(s.startTime)}
-
-**Duration:** ${formatTime(s.duration)}
-**Participants:** ${s.speakers.join(', ')}
-
----
-
-## Executive Summary
-${s.analysis.summary}
-
-## Meeting Quality Metrics
-- Action Item Clarity: ${s.analysis.meetingEffectiveness?.productivity?.actionClarity || 'N/A'}%
-- Participation Balance: ${s.analysis.meetingEffectiveness?.productivity?.participationBalance || 'N/A'}%
-- Solution Focus: ${s.analysis.meetingEffectiveness?.health?.solutionFocus || 'N/A'}%
-- Forward Looking: ${s.analysis.meetingEffectiveness?.health?.forwardLooking || 'N/A'}%
-
-## Topics Discussed
-${s.analysis.topics.map(t => `- ${t.word} (×${t.count})`).join('\n') || 'None detected'}
-
-## Decisions Made
-${s.analysis.decisions.map((d, i) => `${i + 1}. ${d.text || d}`).join('\n') || 'None recorded'}
-
-## Action Items
-${s.analysis.actions.map(a => `- [ ] ${a.action} — *Owner: ${a.owner}* ${a.hasDeadline ? '(has deadline)' : ''}${a.commitmentStrength === 'strong' ? ' ✓ Strong commitment' : ''}`).join('\n') || 'None identified'}
-
-## Influence Tactics Detected
-${s.analysis.influenceTactics?.length > 0 ? s.analysis.influenceTactics.map(t => `- ${t.speaker}: ${t.type.replace('_', ' ')} — ${t.description}`).join('\n') : 'None detected'}
-
-## Alignment Signals
-**Agreements:** ${s.analysis.alignmentSignals?.agreement?.length || 0}
-**Resistance points:** ${s.analysis.alignmentSignals?.resistance?.length || 0}
-**Understanding gaps:** ${s.analysis.alignmentSignals?.gaps?.length || 0}
-
-## PM Alerts
-${s.analysis.pmPatterns?.scopeCreep?.length > 0 ? '### Scope Creep Signals\n' + s.analysis.pmPatterns.scopeCreep.map(sc => `- ${sc.speaker}: "${sc.signal}"`).join('\n') : ''}
-${s.analysis.pmPatterns?.ambiguity?.length > 0 ? '\n### Ambiguous Terms\n' + [...new Set(s.analysis.pmPatterns.ambiguity.map(a => a.term))].map(t => `- "${t}"`).join('\n') : ''}
-
-## Speaking Time Distribution
-${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) => `- ${sp}: ${pct}%`).join('\n') || 'N/A'}
-
----
-
-## Full Transcript
-
-`;
-    s.segments.forEach(seg => {
-      md += `**${seg.speaker}** [${formatTime(seg.timestamp)}]: ${seg.text}\n\n`;
-    });
-    
-    const blob = new Blob([md], { type: 'text/markdown' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `conversation_${Date.now()}.md`;
-    a.click();
+    let md = `# Conversation - ${formatDate(s.startTime)}\n\n**Duration:** ${formatTime(s.duration)} | **Speakers:** ${s.speakers.join(', ')}\n\n## Summary\n${s.analysis.summary}\n\n## Topics\n${s.analysis.topics.map(t => `- ${t.word} (×${t.count})`).join('\n') || 'None'}\n\n## Actions\n${s.analysis.actions.map(a => `- [ ] ${a.action} — ${a.owner}`).join('\n') || 'None'}\n\n## Transcript\n\n`;
+    s.segments.forEach(seg => { md += `**${seg.speaker}** [${formatTime(seg.timestamp)}]: ${seg.text}\n\n`; });
+    const blob = new Blob([md], { type: 'text/markdown' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `conversation_${Date.now()}.md`; a.click();
   };
 
-  const color = (sp) => ({
-    'Speaker 1': '#6366f1',
-    'Speaker 2': '#ec4899',
-    'Speaker 3': '#14b8a6',
-    'Speaker 4': '#f59e0b',
-    'Speaker 5': '#8b5cf6'
-  }[sp] || '#6b7280');
-  
+  const color = (sp) => ({ 'Speaker 1': '#6366f1', 'Speaker 2': '#ec4899', 'Speaker 3': '#14b8a6', 'Speaker 4': '#f59e0b', 'Speaker 5': '#8b5cf6' }[sp] || '#6b7280');
   const emoji = (l) => l === 'positive' ? '😊' : l === 'negative' ? '😟' : '😐';
   const sentColor = (s) => s > 0.2 ? '#10b981' : s < -0.2 ? '#ef4444' : '#f59e0b';
 
@@ -1562,12 +535,12 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
             <div>
               <h1 style={{ fontSize: '18px', fontWeight: '700', margin: 0 }}>Conversation Intelligence</h1>
               <p style={{ fontSize: '12px', color: mic.permission === 'granted' ? '#10b981' : '#94a3b8', margin: 0 }}>
-                {mic.permission === 'granted' ? '🟢 Ready' : '⚪ Enable mic below'}
+                {mic.permission === 'granted' ? `🟢 Auto-speaker ${settings.autoSpeaker ? 'ON' : 'OFF'}` : '⚪ Enable mic'}
               </p>
             </div>
           </div>
           {recording && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 16px', backgroundColor: paused ? 'rgba(245,158,11,0.2)' : 'rgba(239,68,68,0.2)', borderRadius: '20px', border: `1px solid ${paused ? 'rgba(245,158,11,0.4)' : 'rgba(239,68,68,0.4)'}` }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 16px', backgroundColor: paused ? 'rgba(245,158,11,0.2)' : 'rgba(239,68,68,0.2)', borderRadius: '20px' }}>
               <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: paused ? '#f59e0b' : '#ef4444' }} className={paused ? '' : 'pulse-soft'} />
               <span style={{ fontSize: '14px', fontWeight: '600' }}>{formatTime(elapsed)}</span>
             </div>
@@ -1576,33 +549,9 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
       </header>
 
       {/* Tabs */}
-      <nav style={{ display: 'flex', backgroundColor: '#111118', borderBottom: '1px solid rgba(99,102,241,0.1)', overflowX: 'auto' }}>
-        {[
-          { id: 'record', icon: '🎙️', label: 'Record' },
-          { id: 'analysis', icon: '📊', label: 'Analysis' },
-          { id: 'dynamics', icon: '🎯', label: 'Dynamics' },
-          { id: 'history', icon: '📁', label: 'History' },
-          { id: 'profiles', icon: '👥', label: 'Profiles' }
-        ].map(t => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            style={{
-              flex: '0 0 auto',
-              minWidth: '72px',
-              padding: '14px 12px',
-              backgroundColor: 'transparent',
-              border: 'none',
-              borderBottom: tab === t.id ? '2px solid #6366f1' : '2px solid transparent',
-              color: tab === t.id ? '#e2e8f0' : '#64748b',
-              fontSize: '13px',
-              fontWeight: '600',
-              cursor: 'pointer',
-              whiteSpace: 'nowrap'
-            }}
-          >
-            {t.icon} {t.label}
-          </button>
+      <nav style={{ display: 'flex', backgroundColor: '#111118', borderBottom: '1px solid rgba(99,102,241,0.1)' }}>
+        {[{ id: 'record', icon: '🎙️', label: 'Record' }, { id: 'analysis', icon: '📊', label: 'Analysis' }, { id: 'history', icon: '📁', label: 'History' }, { id: 'profiles', icon: '👥', label: 'Profiles' }].map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: '14px 8px', backgroundColor: 'transparent', border: 'none', borderBottom: tab === t.id ? '2px solid #6366f1' : '2px solid transparent', color: tab === t.id ? '#e2e8f0' : '#64748b', fontSize: '13px', fontWeight: '600', cursor: 'pointer' }}>{t.icon} {t.label}</button>
         ))}
       </nav>
 
@@ -1611,85 +560,63 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
         {tab === 'record' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             
-            {/* Smart Alerts */}
-            {recording && settings.showAlerts && alerts.length > 0 && (
-              <div>
-                {alerts.map(alert => (
-                  <AlertBanner key={alert.id} alert={alert} onDismiss={dismissAlert} />
-                ))}
+            {/* Current Speaker Indicator */}
+            {recording && mode === 'voice' && settings.autoSpeaker && mic.currentSpeaker && (
+              <div className={mic.speakerChanged ? 'speaker-flash' : ''} style={{ padding: '12px 16px', backgroundColor: `${color(mic.currentSpeaker)}15`, border: `2px solid ${color(mic.currentSpeaker)}`, borderRadius: '12px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <div style={{ width: '44px', height: '44px', borderRadius: '50%', backgroundColor: color(mic.currentSpeaker), display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px', fontWeight: '700', color: 'white' }}>{mic.currentSpeaker.replace('Speaker ', '')}</div>
+                <div>
+                  <div style={{ fontWeight: '600', color: color(mic.currentSpeaker), fontSize: '16px' }}>{mic.currentSpeaker} {mic.listening && mic.level > 10 && <span style={{ fontSize: '12px', color: '#10b981' }}>● Speaking</span>}</div>
+                  <div style={{ fontSize: '12px', color: '#64748b' }}>{mic.getSpeakerCount()} speaker{mic.getSpeakerCount() !== 1 ? 's' : ''} detected</div>
+                </div>
               </div>
             )}
             
-            {/* Executive Summary Panel */}
-            {recording && settings.showExecutiveSummary && (
-              <ExecutiveSummaryPanel summary={analysis.executiveSummary} visible={true} />
-            )}
-            
-            {/* Mic Permission Request */}
+            {/* Mic Permission */}
             {mic.permission !== 'granted' && mic.permission !== 'unavailable' && (
-              <Card style={{ textAlign: 'center', padding: '32px 24px', border: '2px solid rgba(99,102,241,0.5)' }}>
+              <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '32px 24px', border: '2px solid rgba(99,102,241,0.5)', textAlign: 'center' }}>
                 <div style={{ fontSize: '64px', marginBottom: '20px' }}>🎤</div>
                 <h3 style={{ margin: '0 0 12px', fontSize: '22px', fontWeight: '700' }}>Enable Microphone</h3>
-                <p style={{ margin: '0 0 24px', fontSize: '15px', color: '#94a3b8' }}>
-                  Tap below to enable voice recording and transcription.
-                </p>
-                {mic.error && (
-                  <div style={{ backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '12px', padding: '12px 16px', marginBottom: '20px', textAlign: 'left' }}>
-                    <div style={{ fontSize: '13px', color: '#fca5a5' }}>{mic.error}</div>
-                  </div>
-                )}
-                <button onClick={mic.requestPermission} className="mic-pulse" style={{ padding: '18px 48px', borderRadius: '16px', border: 'none', background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: 'white', fontSize: '18px', fontWeight: '700', cursor: 'pointer' }}>
-                  🎙️ Allow Microphone
-                </button>
-                <div style={{ marginTop: '24px', paddingTop: '24px', borderTop: '1px solid rgba(99,102,241,0.2)' }}>
-                  <button onClick={() => setMode('manual')} style={{ padding: '10px 20px', borderRadius: '10px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: 'transparent', color: '#94a3b8', fontSize: '14px', cursor: 'pointer' }}>
-                    Use Manual Input
-                  </button>
-                </div>
-              </Card>
+                <p style={{ margin: '0 0 24px', fontSize: '15px', color: '#94a3b8' }}>Voice recording with <strong>automatic speaker detection</strong></p>
+                {mic.error && <div style={{ backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: '12px', padding: '12px', marginBottom: '20px', color: '#fca5a5', fontSize: '13px' }}>{mic.error}</div>}
+                <button onClick={mic.requestPermission} className="mic-pulse" style={{ padding: '18px 48px', borderRadius: '16px', border: 'none', background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: 'white', fontSize: '18px', fontWeight: '700', cursor: 'pointer' }}>🎙️ Allow Microphone</button>
+                <div style={{ marginTop: '24px', paddingTop: '24px', borderTop: '1px solid rgba(99,102,241,0.2)' }}><button onClick={() => setMode('manual')} style={{ padding: '10px 20px', borderRadius: '10px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: 'transparent', color: '#94a3b8', fontSize: '14px', cursor: 'pointer' }}>Use Manual Input</button></div>
+              </div>
             )}
 
             {/* Controls */}
-            <Card>
-              {/* My Name Setting */}
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '6px', fontWeight: '600', textTransform: 'uppercase' }}>You Are</label>
-                <select
-                  value={settings.myName}
-                  onChange={(e) => {
-                    const newSettings = { ...settings, myName: e.target.value };
-                    setSettings(newSettings);
-                    Storage.saveSettings(newSettings);
-                  }}
-                  style={{ padding: '10px 12px', borderRadius: '8px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: '#1e1e2e', color: '#e2e8f0', fontSize: '14px', width: '100%' }}
-                >
-                  {speakers.map(sp => <option key={sp} value={sp}>{sp}</option>)}
-                </select>
-              </div>
-              
-              {/* Speaker Select */}
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '6px', fontWeight: '600', textTransform: 'uppercase' }}>Current Speaker</label>
-                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                  {speakers.map(sp => (
-                    <button key={sp} onClick={() => setSpeaker(sp)} style={{ padding: '10px 16px', borderRadius: '10px', border: speaker === sp ? `2px solid ${color(sp)}` : '1px solid rgba(99,102,241,0.3)', backgroundColor: speaker === sp ? `${color(sp)}20` : 'rgba(30,30,40,0.5)', color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-                      <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', backgroundColor: color(sp), marginRight: '8px' }} />{sp}
-                    </button>
-                  ))}
-                  <button onClick={() => setSpeakers(p => [...p, `Speaker ${p.length + 1}`])} style={{ padding: '10px 16px', borderRadius: '10px', border: '1px dashed rgba(99,102,241,0.4)', backgroundColor: 'transparent', color: '#6366f1', fontSize: '14px', cursor: 'pointer' }}>+ Add</button>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+              {/* Auto Speaker Toggle */}
+              <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap' }}>
+                <div style={{ flex: '1', minWidth: '140px' }}>
+                  <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '6px', fontWeight: '600', textTransform: 'uppercase' }}>Speaker Detection</label>
+                  <button onClick={() => { const ns = { ...settings, autoSpeaker: !settings.autoSpeaker }; setSettings(ns); Storage.saveSettings(ns); }} style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `2px solid ${settings.autoSpeaker ? '#10b981' : 'rgba(99,102,241,0.3)'}`, backgroundColor: settings.autoSpeaker ? 'rgba(16,185,129,0.1)' : 'transparent', color: settings.autoSpeaker ? '#10b981' : '#94a3b8', fontSize: '14px', fontWeight: '600', cursor: 'pointer' }}>{settings.autoSpeaker ? '🤖 Auto' : '✋ Manual'}</button>
+                </div>
+                <div style={{ flex: '1', minWidth: '140px' }}>
+                  <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '6px', fontWeight: '600', textTransform: 'uppercase' }}>You Are</label>
+                  <select value={settings.myName} onChange={(e) => { const ns = { ...settings, myName: e.target.value }; setSettings(ns); Storage.saveSettings(ns); }} style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: '#1e1e2e', color: '#e2e8f0', fontSize: '14px' }}>
+                    {(mic.getSpeakers().length > 0 ? mic.getSpeakers() : ['Speaker 1', 'Speaker 2', 'Speaker 3']).map(sp => <option key={sp} value={sp}>{sp}</option>)}
+                  </select>
                 </div>
               </div>
+
+              {/* Manual Speaker Select */}
+              {(!settings.autoSpeaker || mode === 'manual') && (
+                <div style={{ marginBottom: '16px' }}>
+                  <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '6px', fontWeight: '600', textTransform: 'uppercase' }}>Current Speaker</label>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    {['Speaker 1', 'Speaker 2', 'Speaker 3', 'Speaker 4'].map(sp => (
+                      <button key={sp} onClick={() => setManualSpeaker(sp)} style={{ padding: '10px 16px', borderRadius: '10px', border: manualSpeaker === sp ? `2px solid ${color(sp)}` : '1px solid rgba(99,102,241,0.3)', backgroundColor: manualSpeaker === sp ? `${color(sp)}20` : 'rgba(30,30,40,0.5)', color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}><span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', backgroundColor: color(sp), marginRight: '8px' }} />{sp}</button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Mode Toggle */}
               <div style={{ marginBottom: '16px' }}>
                 <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '6px', fontWeight: '600', textTransform: 'uppercase' }}>Input Mode</label>
                 <div style={{ display: 'flex', gap: '8px' }}>
-                  <button onClick={() => mic.permission === 'granted' ? setMode('voice') : mic.requestPermission()} style={{ flex: 1, padding: '12px', borderRadius: '10px', border: mode === 'voice' ? '2px solid #6366f1' : '1px solid rgba(99,102,241,0.3)', backgroundColor: mode === 'voice' ? 'rgba(99,102,241,0.1)' : 'transparent', color: '#e2e8f0', textAlign: 'left', cursor: 'pointer' }}>
-                    <div style={{ fontWeight: '600', fontSize: '14px' }}>🎙️ Voice {mic.permission === 'granted' && <span style={{ color: '#10b981' }}>✓</span>}</div>
-                  </button>
-                  <button onClick={() => setMode('manual')} style={{ flex: 1, padding: '12px', borderRadius: '10px', border: mode === 'manual' ? '2px solid #6366f1' : '1px solid rgba(99,102,241,0.3)', backgroundColor: mode === 'manual' ? 'rgba(99,102,241,0.1)' : 'transparent', color: '#e2e8f0', textAlign: 'left', cursor: 'pointer' }}>
-                    <div style={{ fontWeight: '600', fontSize: '14px' }}>⌨️ Manual</div>
-                  </button>
+                  <button onClick={() => mic.permission === 'granted' ? setMode('voice') : mic.requestPermission()} style={{ flex: 1, padding: '12px', borderRadius: '10px', border: mode === 'voice' ? '2px solid #6366f1' : '1px solid rgba(99,102,241,0.3)', backgroundColor: mode === 'voice' ? 'rgba(99,102,241,0.1)' : 'transparent', color: '#e2e8f0', textAlign: 'left', cursor: 'pointer' }}><div style={{ fontWeight: '600', fontSize: '14px' }}>🎙️ Voice {mic.permission === 'granted' && '✓'}</div><div style={{ fontSize: '12px', color: '#64748b' }}>Auto speaker detection</div></button>
+                  <button onClick={() => setMode('manual')} style={{ flex: 1, padding: '12px', borderRadius: '10px', border: mode === 'manual' ? '2px solid #6366f1' : '1px solid rgba(99,102,241,0.3)', backgroundColor: mode === 'manual' ? 'rgba(99,102,241,0.1)' : 'transparent', color: '#e2e8f0', textAlign: 'left', cursor: 'pointer' }}><div style={{ fontWeight: '600', fontSize: '14px' }}>⌨️ Manual</div><div style={{ fontSize: '12px', color: '#64748b' }}>Type + select speaker</div></button>
                 </div>
               </div>
 
@@ -1697,26 +624,18 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
               {recording && mode === 'voice' && mic.listening && (
                 <div style={{ marginBottom: '16px' }}>
                   <label style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginBottom: '6px', fontWeight: '600', textTransform: 'uppercase' }}>🎤 Audio Level</label>
-                  <div style={{ height: '12px', backgroundColor: '#1e1e2e', borderRadius: '6px', overflow: 'hidden' }}>
-                    <div style={{ width: `${mic.level}%`, height: '100%', background: mic.level > 70 ? '#ef4444' : mic.level > 40 ? '#f59e0b' : '#10b981', borderRadius: '6px', transition: 'width 0.05s' }} />
-                  </div>
+                  <div style={{ height: '12px', backgroundColor: '#1e1e2e', borderRadius: '6px', overflow: 'hidden' }}><div style={{ width: `${mic.level}%`, height: '100%', background: mic.level > 70 ? '#ef4444' : mic.level > 40 ? '#f59e0b' : '#10b981', borderRadius: '6px', transition: 'width 0.05s' }} /></div>
                 </div>
               )}
 
               {/* Record Buttons */}
               <div style={{ display: 'flex', justifyContent: 'center', gap: '16px', marginBottom: '16px' }}>
                 {!recording ? (
-                  <button onClick={startRec} style={{ width: '100px', height: '100px', borderRadius: '50%', border: 'none', background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: 'white', fontSize: '36px', cursor: 'pointer', boxShadow: '0 0 40px rgba(99,102,241,0.4)' }}>
-                    {mode === 'voice' ? '🎙️' : '▶️'}
-                  </button>
+                  <button onClick={startRec} style={{ width: '100px', height: '100px', borderRadius: '50%', border: 'none', background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: 'white', fontSize: '36px', cursor: 'pointer', boxShadow: '0 0 40px rgba(99,102,241,0.4)' }}>{mode === 'voice' ? '🎙️' : '▶️'}</button>
                 ) : (
                   <>
-                    <button onClick={togglePause} style={{ width: '70px', height: '70px', borderRadius: '50%', border: 'none', backgroundColor: paused ? '#10b981' : '#f59e0b', color: 'white', fontSize: '24px', cursor: 'pointer' }}>
-                      {paused ? '▶️' : '⏸️'}
-                    </button>
-                    <button onClick={stopRec} style={{ width: '70px', height: '70px', borderRadius: '50%', border: 'none', backgroundColor: '#ef4444', color: 'white', fontSize: '24px', cursor: 'pointer' }}>
-                      ⏹️
-                    </button>
+                    <button onClick={togglePause} style={{ width: '70px', height: '70px', borderRadius: '50%', border: 'none', backgroundColor: paused ? '#10b981' : '#f59e0b', color: 'white', fontSize: '24px', cursor: 'pointer' }}>{paused ? '▶️' : '⏸️'}</button>
+                    <button onClick={stopRec} style={{ width: '70px', height: '70px', borderRadius: '50%', border: 'none', backgroundColor: '#ef4444', color: 'white', fontSize: '24px', cursor: 'pointer' }}>⏹️</button>
                   </>
                 )}
               </div>
@@ -1724,36 +643,24 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
               {/* Manual Input */}
               {recording && mode === 'manual' && (
                 <form onSubmit={(e) => { e.preventDefault(); if (manual.trim()) { addSeg(manual); setManual(''); }}} style={{ display: 'flex', gap: '8px' }}>
-                  <input value={manual} onChange={e => setManual(e.target.value)} placeholder={`Type what ${speaker} said...`} style={{ flex: 1, padding: '14px 16px', borderRadius: '12px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: 'rgba(30,30,40,0.5)', color: '#e2e8f0', fontSize: '16px', outline: 'none' }} />
+                  <input value={manual} onChange={e => setManual(e.target.value)} placeholder={`Type what ${manualSpeaker} said...`} style={{ flex: 1, padding: '14px 16px', borderRadius: '12px', border: '1px solid rgba(99,102,241,0.3)', backgroundColor: 'rgba(30,30,40,0.5)', color: '#e2e8f0', fontSize: '16px', outline: 'none' }} />
                   <button type="submit" style={{ padding: '14px 24px', borderRadius: '12px', border: 'none', backgroundColor: '#6366f1', color: 'white', fontWeight: '600', cursor: 'pointer' }}>Add</button>
                 </form>
               )}
 
               {/* Interim */}
               {recording && mic.listening && mic.interim && (
-                <div style={{ marginTop: '16px', padding: '12px 16px', backgroundColor: 'rgba(99,102,241,0.1)', borderRadius: '10px', borderLeft: '3px solid #6366f1' }}>
-                  <span style={{ fontSize: '12px', color: '#94a3b8' }}>🎤 Hearing...</span>
+                <div style={{ marginTop: '16px', padding: '12px 16px', backgroundColor: 'rgba(99,102,241,0.1)', borderRadius: '10px', borderLeft: `3px solid ${mic.currentSpeaker ? color(mic.currentSpeaker) : '#6366f1'}` }}>
+                  <span style={{ fontSize: '12px', color: '#94a3b8' }}>🎤 {mic.currentSpeaker || 'Detecting'}...</span>
                   <p style={{ margin: '4px 0 0', color: '#cbd5e1', fontStyle: 'italic' }}>{mic.interim}</p>
                 </div>
               )}
-            </Card>
-
-            {/* Influence Tactics Panel */}
-            {recording && analysis.influenceTactics.length > 0 && (
-              <InfluenceTacticsPanel tactics={analysis.influenceTactics} />
-            )}
-
-            {/* PM Alerts */}
-            {recording && (analysis.pmPatterns.scopeCreep.length > 0 || analysis.pmPatterns.ambiguity.length > 0) && (
-              <PMAlertPanel pmPatterns={analysis.pmPatterns} />
-            )}
+            </div>
 
             {/* Transcript */}
             {(recording || segments.length > 0) && (
-              <Card>
-                <h3 style={{ fontSize: '14px', fontWeight: '600', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>
-                  Live Transcript ({segments.length})
-                </h3>
+              <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '20px', border: '1px solid rgba(99,102,241,0.2)' }}>
+                <h3 style={{ fontSize: '14px', fontWeight: '600', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Transcript ({segments.length}) • {[...new Set(segments.map(s => s.speaker))].length} speakers</h3>
                 <div ref={scrollRef} style={{ maxHeight: '300px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                   {segments.map(s => (
                     <div key={s.id} style={{ padding: '12px 16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '12px', borderLeft: `3px solid ${color(s.speaker)}` }}>
@@ -1764,28 +671,22 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
                       <p style={{ margin: 0, fontSize: '15px', color: '#e2e8f0' }}>{s.text}</p>
                     </div>
                   ))}
-                  {segments.length === 0 && (
-                    <p style={{ textAlign: 'center', color: '#64748b', padding: '40px 0' }}>
-                      {recording ? (mode === 'voice' ? '🎤 Listening...' : '⌨️ Type to add...') : 'No transcript'}
-                    </p>
-                  )}
+                  {segments.length === 0 && <p style={{ textAlign: 'center', color: '#64748b', padding: '40px 0' }}>{recording ? (mode === 'voice' ? '🎤 Listening for speakers...' : '⌨️ Type to add...') : 'No transcript'}</p>}
                 </div>
-              </Card>
+              </div>
             )}
 
-            {/* Real-time Insights */}
+            {/* Insights */}
             {recording && insights.length > 0 && (
-              <Card style={{ borderColor: 'rgba(16,185,129,0.3)' }}>
-                <h3 style={{ fontSize: '14px', fontWeight: '600', color: '#10b981', marginBottom: '12px' }}>🎯 Strategic Intelligence</h3>
+              <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '20px', border: '1px solid rgba(16,185,129,0.3)' }}>
+                <h3 style={{ fontSize: '14px', fontWeight: '600', color: '#10b981', marginBottom: '12px' }}>🎯 Insights</h3>
                 {insights.map((ins, i) => (
-                  <div key={i} style={{ padding: '10px 14px', backgroundColor: ins.priority === 'high' ? 'rgba(239,68,68,0.1)' : 'rgba(30,30,40,0.5)', borderRadius: '10px', borderLeft: `3px solid ${ins.priority === 'high' ? '#ef4444' : '#10b981'}`, marginBottom: '8px' }}>
-                    <div style={{ fontWeight: '600', fontSize: '13px', color: '#e2e8f0' }}>
-                      {ins.type === 'warning' ? '⚠️' : ins.type === 'opportunity' ? '✨' : '🎯'} {ins.message}
-                    </div>
+                  <div key={i} style={{ padding: '10px 14px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px', borderLeft: `3px solid ${ins.type === 'warning' ? '#ef4444' : '#10b981'}`, marginBottom: '8px' }}>
+                    <div style={{ fontWeight: '600', fontSize: '13px', color: '#e2e8f0' }}>{ins.type === 'warning' ? '⚠️' : '✨'} {ins.message}</div>
                     <div style={{ fontSize: '13px', color: '#10b981' }}>→ {ins.action}</div>
                   </div>
                 ))}
-              </Card>
+              </div>
             )}
           </div>
         )}
@@ -1793,15 +694,13 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
         {/* ANALYSIS TAB */}
         {tab === 'analysis' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <Card style={{ textAlign: 'center' }}>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)', textAlign: 'center' }}>
               <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '12px', textTransform: 'uppercase' }}>Overall Sentiment</h3>
               <div style={{ fontSize: '56px' }}>{emoji(analysis.sentiment.label)}</div>
               <div style={{ fontSize: '20px', fontWeight: '700', color: sentColor(analysis.sentiment.score) }}>{analysis.sentiment.label.toUpperCase()}</div>
-            </Card>
+            </div>
             
-            <MeetingQualityDashboard metrics={analysis.meetingEffectiveness} />
-            
-            <Card>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
               <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Speaker Stats</h3>
               {Object.entries(analysis.stats).map(([sp, st]) => (
                 <div key={sp} style={{ padding: '16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '12px', borderLeft: `3px solid ${color(sp)}`, marginBottom: '12px' }}>
@@ -1810,155 +709,33 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
                     <span style={{ fontSize: '24px' }}>{emoji(st.sentiment?.label)}</span>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', textAlign: 'center' }}>
-                    <div>
-                      <div style={{ fontSize: '18px', fontWeight: '700' }}>{st.count}</div>
-                      <div style={{ fontSize: '11px', color: '#64748b' }}>Segments</div>
-                    </div>
-                    <div>
-                      <div style={{ fontSize: '18px', fontWeight: '700' }}>{st.words}</div>
-                      <div style={{ fontSize: '11px', color: '#64748b' }}>Words</div>
-                    </div>
-                    <div>
-                      <div style={{ fontSize: '18px', fontWeight: '700' }}>{analysis.powerDynamics.speakingTime[sp] || 0}%</div>
-                      <div style={{ fontSize: '11px', color: '#64748b' }}>Talk Time</div>
-                    </div>
+                    <div><div style={{ fontSize: '18px', fontWeight: '700' }}>{st.count}</div><div style={{ fontSize: '11px', color: '#64748b' }}>Segments</div></div>
+                    <div><div style={{ fontSize: '18px', fontWeight: '700' }}>{st.words}</div><div style={{ fontSize: '11px', color: '#64748b' }}>Words</div></div>
+                    <div><div style={{ fontSize: '18px', fontWeight: '700' }}>{st.pct}%</div><div style={{ fontSize: '11px', color: '#64748b' }}>Talk Time</div></div>
                   </div>
                 </div>
               ))}
               {Object.keys(analysis.stats).length === 0 && <p style={{ textAlign: 'center', color: '#64748b' }}>No data yet</p>}
-            </Card>
+            </div>
             
-            <Card>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
               <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Topics</h3>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
-                {analysis.topics.map((t, i) => (
-                  <Badge key={i}>{t.word} ×{t.count}</Badge>
-                ))}
+                {analysis.topics.map((t, i) => <span key={i} style={{ padding: '8px 16px', backgroundColor: 'rgba(99,102,241,0.15)', borderRadius: '20px', fontSize: '14px' }}>{t.word} <span style={{ color: '#6366f1' }}>×{t.count}</span></span>)}
                 {analysis.topics.length === 0 && <p style={{ color: '#64748b', width: '100%', textAlign: 'center' }}>Topics appear as you talk</p>}
               </div>
-            </Card>
+            </div>
             
-            <Card>
+            <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
               <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase' }}>Action Items ({analysis.actions.length})</h3>
               {analysis.actions.map((a, i) => (
-                <div key={i} style={{ padding: '12px 16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px', marginBottom: '8px', borderLeft: `3px solid ${a.commitmentStrength === 'strong' ? '#10b981' : '#f59e0b'}` }}>
+                <div key={i} style={{ padding: '12px 16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px', marginBottom: '8px', borderLeft: `3px solid ${color(a.owner)}` }}>
                   <p style={{ margin: 0, fontSize: '14px' }}>{a.action}</p>
-                  <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
-                    <Badge color={color(a.owner)}>{a.owner}</Badge>
-                    {a.hasDeadline && <Badge color="#10b981">📅 Has deadline</Badge>}
-                    {a.commitmentStrength === 'strong' && <Badge color="#10b981">✓ Strong</Badge>}
-                  </div>
+                  <span style={{ display: 'inline-block', marginTop: '6px', padding: '4px 10px', borderRadius: '12px', fontSize: '12px', backgroundColor: `${color(a.owner)}20`, color: color(a.owner) }}>{a.owner}</span>
                 </div>
               ))}
               {analysis.actions.length === 0 && <p style={{ textAlign: 'center', color: '#64748b' }}>Action items extracted automatically</p>}
-            </Card>
-          </div>
-        )}
-
-        {/* DYNAMICS TAB */}
-        {tab === 'dynamics' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <InfluenceTacticsPanel tactics={analysis.influenceTactics} />
-            
-            <Card>
-              <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span>🤝</span> Alignment Signals
-              </h3>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '16px' }}>
-                <div style={{ padding: '16px', backgroundColor: 'rgba(16,185,129,0.1)', borderRadius: '12px', textAlign: 'center' }}>
-                  <div style={{ fontSize: '28px', fontWeight: '700', color: '#10b981' }}>{analysis.alignmentSignals.agreement.length}</div>
-                  <div style={{ fontSize: '12px', color: '#6ee7b7' }}>Agreements</div>
-                </div>
-                <div style={{ padding: '16px', backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: '12px', textAlign: 'center' }}>
-                  <div style={{ fontSize: '28px', fontWeight: '700', color: '#ef4444' }}>{analysis.alignmentSignals.resistance.length}</div>
-                  <div style={{ fontSize: '12px', color: '#fca5a5' }}>Resistance</div>
-                </div>
-              </div>
-              {analysis.alignmentSignals.gaps.length > 0 && (
-                <div>
-                  <div style={{ fontSize: '12px', color: '#f59e0b', fontWeight: '600', marginBottom: '8px' }}>⚠️ Understanding Gaps</div>
-                  {analysis.alignmentSignals.gaps.map((g, i) => (
-                    <Badge key={i} color="#f59e0b" style={{ marginRight: '8px', marginBottom: '8px' }}>
-                      {g.speaker}: {g.type}
-                    </Badge>
-                  ))}
-                </div>
-              )}
-            </Card>
-            
-            <Card>
-              <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span>⚖️</span> Power Dynamics
-              </h3>
-              <div style={{ marginBottom: '16px' }}>
-                <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>Speaking Time Distribution</div>
-                {Object.entries(analysis.powerDynamics.speakingTime).map(([sp, pct]) => (
-                  <div key={sp} style={{ marginBottom: '8px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                      <span style={{ fontSize: '13px', color: color(sp), fontWeight: '600' }}>{sp}</span>
-                      <span style={{ fontSize: '13px' }}>{pct}%</span>
-                    </div>
-                    <ProgressBar value={pct} color={color(sp)} height={8} />
-                  </div>
-                ))}
-              </div>
-              {analysis.powerDynamics.deferenceMarkers.length > 0 && (
-                <div>
-                  <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '8px' }}>Deference Signals</div>
-                  {analysis.powerDynamics.deferenceMarkers.map((d, i) => (
-                    <Badge key={i} style={{ marginRight: '8px' }}>{d.from} deferred</Badge>
-                  ))}
-                </div>
-              )}
-            </Card>
-            
-            <Card>
-              <h3 style={{ fontSize: '14px', color: '#94a3b8', marginBottom: '16px', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span>🎲</span> Negotiation Dynamics
-              </h3>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '16px' }}>
-                <div style={{ padding: '12px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px' }}>
-                  <div style={{ fontSize: '20px', fontWeight: '700' }}>{analysis.negotiation.anchors.length}</div>
-                  <div style={{ fontSize: '11px', color: '#64748b' }}>Anchors Set</div>
-                </div>
-                <div style={{ padding: '12px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px' }}>
-                  <div style={{ fontSize: '20px', fontWeight: '700' }}>{analysis.negotiation.concessions.length}</div>
-                  <div style={{ fontSize: '11px', color: '#64748b' }}>Concessions</div>
-                </div>
-              </div>
-              
-              {analysis.negotiation.framing && (
-                <div style={{ marginBottom: '12px' }}>
-                  <Badge color={analysis.negotiation.framing === 'collaborative' ? '#10b981' : '#ef4444'}>
-                    {analysis.negotiation.framing === 'collaborative' ? '🤝 Win-Win Framing' : '⚔️ Competitive Framing'}
-                  </Badge>
-                </div>
-              )}
-              
-              {analysis.negotiation.batna.length > 0 && (
-                <div style={{ marginBottom: '12px' }}>
-                  <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '6px' }}>BATNA References</div>
-                  {analysis.negotiation.batna.slice(0, 3).map((b, i) => (
-                    <div key={i} style={{ fontSize: '13px', color: '#94a3b8', marginBottom: '4px' }}>
-                      • {b.speaker}: "{b.mention}..."
-                    </div>
-                  ))}
-                </div>
-              )}
-              
-              {analysis.negotiation.reciprocity.length > 0 && (
-                <div>
-                  <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '6px' }}>Reciprocity Patterns</div>
-                  {analysis.negotiation.reciprocity.slice(0, 3).map((r, i) => (
-                    <div key={i} style={{ fontSize: '13px', color: '#94a3b8', marginBottom: '4px' }}>
-                      • {r.speaker}: "{r.text}..."
-                    </div>
-                  ))}
-                </div>
-              )}
-            </Card>
-            
-            <PMAlertPanel pmPatterns={analysis.pmPatterns} />
+            </div>
           </div>
         )}
 
@@ -1968,47 +745,20 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
             {selected ? (
               <>
                 <button onClick={() => setSelected(null)} style={{ padding: '10px 16px', backgroundColor: 'transparent', border: '1px solid rgba(99,102,241,0.3)', borderRadius: '10px', color: '#6366f1', fontSize: '14px', cursor: 'pointer', alignSelf: 'flex-start' }}>← Back</button>
-                <Card>
+                <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', marginBottom: '20px' }}>
-                    <div>
-                      <h2 style={{ margin: 0, fontSize: '18px' }}>{formatDate(selected.startTime)}</h2>
-                      <p style={{ margin: '4px 0 0', fontSize: '14px', color: '#64748b' }}>{formatTime(selected.duration)} • {selected.speakers.join(', ')}</p>
-                    </div>
+                    <div><h2 style={{ margin: 0, fontSize: '18px' }}>{formatDate(selected.startTime)}</h2><p style={{ margin: '4px 0 0', fontSize: '14px', color: '#64748b' }}>{formatTime(selected.duration)} • {selected.speakers.join(', ')}</p></div>
                     <button onClick={() => exportMD(selected)} style={{ padding: '8px 16px', backgroundColor: '#6366f1', border: 'none', borderRadius: '8px', color: 'white', fontSize: '13px', fontWeight: '600', cursor: 'pointer' }}>📄 Export</button>
                   </div>
-                  <div style={{ padding: '16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '12px', marginBottom: '16px' }}>
-                    <h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Summary</h4>
-                    <p style={{ margin: 0, fontSize: '15px', lineHeight: '1.6' }}>{selected.analysis.summary}</p>
-                  </div>
-                  
-                  {/* Meeting Quality for saved session */}
-                  {selected.analysis.meetingEffectiveness && (
-                    <div style={{ marginBottom: '16px' }}>
-                      <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Meeting Quality</h4>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px' }}>
-                        <div style={{ padding: '10px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '8px', textAlign: 'center' }}>
-                          <div style={{ fontSize: '16px', fontWeight: '700' }}>{selected.analysis.meetingEffectiveness.productivity?.actionClarity || 0}%</div>
-                          <div style={{ fontSize: '11px', color: '#64748b' }}>Action Clarity</div>
-                        </div>
-                        <div style={{ padding: '10px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '8px', textAlign: 'center' }}>
-                          <div style={{ fontSize: '16px', fontWeight: '700' }}>{selected.analysis.meetingEffectiveness.productivity?.participationBalance || 0}%</div>
-                          <div style={{ fontSize: '11px', color: '#64748b' }}>Participation</div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  
+                  <div style={{ padding: '16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '12px', marginBottom: '16px' }}><h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Summary</h4><p style={{ margin: 0, fontSize: '15px', lineHeight: '1.6' }}>{selected.analysis.summary}</p></div>
                   <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Transcript</h4>
                   {selected.segments.map(s => (
                     <div key={s.id} style={{ padding: '12px 16px', backgroundColor: 'rgba(30,30,40,0.5)', borderRadius: '10px', borderLeft: `3px solid ${color(s.speaker)}`, marginBottom: '8px' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                        <span style={{ fontWeight: '600', color: color(s.speaker), fontSize: '13px' }}>{s.speaker}</span>
-                        <span style={{ fontSize: '11px', color: '#64748b' }}>{formatTime(s.timestamp)}</span>
-                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}><span style={{ fontWeight: '600', color: color(s.speaker), fontSize: '13px' }}>{s.speaker}</span><span style={{ fontSize: '11px', color: '#64748b' }}>{formatTime(s.timestamp)}</span></div>
                       <p style={{ margin: 0, fontSize: '14px' }}>{s.text}</p>
                     </div>
                   ))}
-                </Card>
+                </div>
               </>
             ) : (
               <>
@@ -2017,10 +767,7 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
                 {sessions.map(s => (
                   <div key={s.id} onClick={() => setSelected(s)} style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '20px', border: '1px solid rgba(99,102,241,0.2)', cursor: 'pointer' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <div>
-                        <h3 style={{ margin: '0 0 4px', fontSize: '16px' }}>{formatDate(s.startTime)}</h3>
-                        <p style={{ margin: 0, fontSize: '13px', color: '#64748b' }}>{formatTime(s.duration)} • {s.speakers.join(', ')}</p>
-                      </div>
+                      <div><h3 style={{ margin: '0 0 4px', fontSize: '16px' }}>{formatDate(s.startTime)}</h3><p style={{ margin: 0, fontSize: '13px', color: '#64748b' }}>{formatTime(s.duration)} • {s.speakers.join(', ')}</p></div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                         <span style={{ fontSize: '24px' }}>{emoji(s.analysis.sentiment.label)}</span>
                         <button onClick={(e) => { e.stopPropagation(); if (confirm('Delete?')) { const u = sessions.filter(x => x.id !== s.id); setSessions(u); Storage.saveSessions(u); }}} style={{ padding: '6px 10px', backgroundColor: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '6px', color: '#ef4444', fontSize: '12px', cursor: 'pointer' }}>🗑️</button>
@@ -2029,13 +776,7 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
                     <p style={{ margin: '12px 0 0', fontSize: '14px', color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{s.analysis.summary}</p>
                   </div>
                 ))}
-                {sessions.length === 0 && (
-                  <Card style={{ textAlign: 'center', padding: '60px 20px' }}>
-                    <div style={{ fontSize: '48px', marginBottom: '16px' }}>📁</div>
-                    <h3 style={{ margin: '0 0 8px' }}>No Sessions Yet</h3>
-                    <p style={{ margin: 0, color: '#64748b', fontSize: '14px' }}>Start recording to save sessions</p>
-                  </Card>
-                )}
+                {sessions.length === 0 && <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '60px 20px', border: '1px solid rgba(99,102,241,0.2)', textAlign: 'center' }}><div style={{ fontSize: '48px', marginBottom: '16px' }}>📁</div><h3 style={{ margin: '0 0 8px' }}>No Sessions</h3><p style={{ margin: 0, color: '#64748b', fontSize: '14px' }}>Start recording to save sessions</p></div>}
               </>
             )}
           </div>
@@ -2045,64 +786,45 @@ ${Object.entries(s.analysis.powerDynamics?.speakingTime || {}).map(([sp, pct]) =
         {tab === 'profiles' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             <h2 style={{ fontSize: '20px', fontWeight: '700', margin: 0 }}>Speaker Profiles</h2>
-            <p style={{ fontSize: '14px', color: '#64748b', margin: '0 0 12px' }}>Built from conversation analysis</p>
-            {Object.entries(profiles).map(([name, p]) => {
-              const briefing = NLP.generateBriefing(p, name);
-              return (
-                <Card key={p.id}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
-                    <div style={{ width: '56px', height: '56px', borderRadius: '50%', backgroundColor: color(name), display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px', fontWeight: '700', color: 'white' }}>{name.charAt(0)}</div>
-                    <div>
-                      <h3 style={{ margin: 0, fontSize: '18px' }}>{name}</h3>
-                      <p style={{ margin: '4px 0 0', fontSize: '13px', color: '#64748b' }}>{p.sessions?.length || 0} sessions</p>
+            <p style={{ fontSize: '14px', color: '#64748b', margin: '0 0 12px' }}>Built from conversations</p>
+            {Object.entries(profiles).map(([name, p]) => (
+              <div key={p.id} style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '24px', border: '1px solid rgba(99,102,241,0.2)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+                  <div style={{ width: '56px', height: '56px', borderRadius: '50%', backgroundColor: color(name), display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px', fontWeight: '700', color: 'white' }}>{name.charAt(0)}</div>
+                  <div><h3 style={{ margin: 0, fontSize: '18px' }}>{name}</h3><p style={{ margin: '4px 0 0', fontSize: '13px', color: '#64748b' }}>{p.sessions?.length || 0} sessions</p></div>
+                </div>
+                {p.communicationStyle && Object.keys(p.communicationStyle).length > 0 && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Style</h4>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px' }}>
+                      {['assertiveness', 'directnessLevel', 'collaborativeIndex'].map(k => (
+                        <div key={k}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}><span style={{ fontSize: '12px', color: '#94a3b8', textTransform: 'capitalize' }}>{k.replace(/([A-Z])/g, ' $1')}</span><span style={{ fontSize: '12px', fontWeight: '600' }}>{p.communicationStyle[k] || 0}%</span></div>
+                          <div style={{ height: '6px', backgroundColor: '#1e1e2e', borderRadius: '3px', overflow: 'hidden' }}><div style={{ width: `${p.communicationStyle[k] || 0}%`, height: '100%', backgroundColor: '#6366f1', borderRadius: '3px' }} /></div>
+                        </div>
+                      ))}
+                      <div><span style={{ fontSize: '12px', color: '#94a3b8' }}>Pace</span><div style={{ marginTop: '4px', padding: '6px 12px', backgroundColor: 'rgba(99,102,241,0.15)', borderRadius: '6px', fontSize: '13px', display: 'inline-block', textTransform: 'capitalize' }}>{p.communicationStyle.preferredPace || 'Unknown'}</div></div>
                     </div>
                   </div>
-                  
-                  {p.communicationStyle && Object.keys(p.communicationStyle).length > 0 && (
-                    <div style={{ marginBottom: '20px' }}>
-                      <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Communication Style</h4>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px' }}>
-                        <ProgressBar value={p.communicationStyle.assertiveness || 0} label="Assertiveness" color="#6366f1" />
-                        <ProgressBar value={p.communicationStyle.collaborativeIndex || 0} label="Collaborative" color="#10b981" />
-                        <ProgressBar value={p.communicationStyle.dataDriven || 50} label="Data-Driven" color="#f59e0b" />
-                        <ProgressBar value={p.communicationStyle.riskTolerance || 50} label="Risk Tolerance" color="#ec4899" />
-                      </div>
-                      <div style={{ display: 'flex', gap: '8px', marginTop: '12px', flexWrap: 'wrap' }}>
-                        <Badge>Pace: {p.communicationStyle.preferredPace || 'Unknown'}</Badge>
-                        <Badge>Decision: {p.communicationStyle.decisionStyle || 'Unknown'}</Badge>
-                      </div>
-                    </div>
-                  )}
-                  
-                  {briefing && briefing.length > 1 && (
-                    <div style={{ padding: '16px', backgroundColor: 'rgba(16,185,129,0.1)', borderRadius: '12px', borderLeft: '3px solid #10b981' }}>
-                      <h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#10b981' }}>🎯 Strategic Briefing</h4>
-                      {briefing.slice(1).map((line, i) => (
-                        <p key={i} style={{ margin: '4px 0', fontSize: '14px', lineHeight: '1.5', color: '#e2e8f0' }}>{line}</p>
+                )}
+                {p.topicsDiscussed && Object.keys(p.topicsDiscussed).length > 0 && (
+                  <div>
+                    <h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#94a3b8', textTransform: 'uppercase' }}>Top Topics</h4>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                      {Object.entries(p.topicsDiscussed).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([word, count], i) => (
+                        <span key={i} style={{ padding: '4px 10px', backgroundColor: 'rgba(99,102,241,0.1)', borderRadius: '12px', fontSize: '12px' }}>{word}</span>
                       ))}
                     </div>
-                  )}
-                </Card>
-              );
-            })}
-            {Object.keys(profiles).length === 0 && (
-              <Card style={{ textAlign: 'center', padding: '60px 20px' }}>
-                <div style={{ fontSize: '48px', marginBottom: '16px' }}>👥</div>
-                <h3 style={{ margin: '0 0 8px' }}>No Profiles Yet</h3>
-                <p style={{ margin: 0, color: '#64748b', fontSize: '14px' }}>Profiles build automatically from conversations</p>
-              </Card>
-            )}
+                  </div>
+                )}
+              </div>
+            ))}
+            {Object.keys(profiles).length === 0 && <div style={{ backgroundColor: '#111118', borderRadius: '16px', padding: '60px 20px', border: '1px solid rgba(99,102,241,0.2)', textAlign: 'center' }}><div style={{ fontSize: '48px', marginBottom: '16px' }}>👥</div><h3 style={{ margin: '0 0 8px' }}>No Profiles</h3><p style={{ margin: 0, color: '#64748b', fontSize: '14px' }}>Profiles build from conversations</p></div>}
           </div>
         )}
       </main>
 
-      {/* End of Meeting Summary Modal */}
-      {showEndSummary && (
-        <EndMeetingSummary summary={analysis.executiveSummary} onClose={() => setShowEndSummary(false)} />
-      )}
-
       <style>{`
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
         input:focus, button:focus, select:focus { outline: none; }
         ::-webkit-scrollbar { width: 6px; }
